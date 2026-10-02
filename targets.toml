@@ -4,6 +4,11 @@
 # Each [[benchmarks]] block may hold `perf`, `accuracy` and/or `context`
 # tables, and optionally `models` / `exclude_models` globs that narrow it.
 # Lower tiers are completed for every model before any higher tier starts.
+#
+# Priorities follow how the models are used: mainly with Hermes Agent, which
+# needs >= 64k context and tool calling, runs with thinking on
+# (reasoning_effort: medium), and sends ~60k-token prompts that are mostly
+# prefix-cached (from oMLX usage history, 2026-10-02).
 
 [runner]
 quiet_minutes = 10        # no API traffic for this long before a run starts
@@ -13,27 +18,31 @@ include = ["*"]           # glob patterns against oMLX model ids
 exclude = []
 types = ["llm", "vlm"]
 
-# Tier 1: the oMLX web UI defaults. A quick speed baseline for every model.
+# Tier 1 (done for all models): the oMLX web UI defaults, a quick speed
+# baseline.
 [[benchmarks]]
 tier = 1
 perf = { prompt_lengths = [1024, 4096], batch_sizes = [2, 4], context_profile = "code_python" }
 
-# Tier 2: a cheap intelligence baseline (thinking off, greedy).
+# Tier 2: speed and memory at Hermes-sized contexts, and the largest prompt
+# that actually fits in memory.
 [[benchmarks]]
 tier = 2
-accuracy = { suites = { mmlu = 300, gsm8k = 100, humaneval = 0 } }
+perf = { prompt_lengths = [16384, 32768, 65536] }
+context = { target_tokens = 131072 }
+# Devstral ran at 15 tok/s at 4k context in tier 1: far too slow for an agent.
+exclude_models = ["Devstral-*"]
 
-# Tier 3: long-prompt speed, and the largest prompt memory allows.
+# Tier 3: capability in the mode Hermes uses (thinking on). Comparing the
+# abliterated/uncensored variants with their siblings shows what uncensoring
+# costs.
 [[benchmarks]]
 tier = 3
-perf = { prompt_lengths = [16384, 32768] }
-context = { target_tokens = 131072 }
+accuracy = { suites = { gsm8k = 100, mmlu_pro = 300, humaneval = 0, mbpp = 200 }, enable_thinking = true }
+exclude_models = ["Devstral-*"]
 
-# Tier 4: broader intelligence coverage.
-[[benchmarks]]
-tier = 4
-accuracy = { suites = { mmlu = 1000, truthfulqa = 0, mbpp = 200, livecodebench = 100 } }
-
-# Ideas for later:
-# perf = { prompt_lengths = [65536, 131072] }
-# accuracy = { suites = { gsm8k = 100, mmlu_pro = 300 }, enable_thinking = true }
+# Later, for finalists only (thinking on, ~16k tokens per question):
+# [[benchmarks]]
+# tier = 5
+# accuracy = { suites = { livecodebench = 100 }, enable_thinking = true }
+# models = ["..."]

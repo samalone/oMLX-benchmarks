@@ -18,6 +18,9 @@ For anything the digest doesn't answer, query the database directly:
 
 ## Operating the runner
 
+- The runner is installed as a launchd agent (`launchd/install.sh`; `launchd/install.sh
+  uninstall` removes it), so it is normally already running. Its log is `data/runner.log`.
+  Restart it after code changes with `launchctl kickstart -k gui/$(id -u)/com.samalone.omlxbench`.
 - `uv run omlxbench run`: long-running loop. It starts a benchmark only after
   `quiet_minutes` (in `targets.toml`) with no API traffic, and cancels it when the
   user starts using the server.
