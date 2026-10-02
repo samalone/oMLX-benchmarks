@@ -1,6 +1,5 @@
 .env
 /data/
-/omlxbench/data/bfcl_v3/
 __pycache__/
 *.pyc
 .venv/

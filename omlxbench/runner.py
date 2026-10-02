@@ -232,6 +232,10 @@ class Runner:
         """Close out runs a previous runner left 'running' (crash, reboot)."""
         for run in self.db.q("SELECT * FROM runs WHERE status = 'running' AND source = 'runner'"):
             server_status = None
+            if run["kind"] in ("tools", "agent_turns"):
+                # Our own requests died with the old process; nothing to cancel.
+                self.db.finish_run(run["id"], status="interrupted", error="runner exited mid-run")
+                continue
             try:
                 result = self.client.results(run["kind"], run["omlx_bench_id"])
                 if run["kind"] == "accuracy":
