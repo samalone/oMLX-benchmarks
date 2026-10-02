@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import threading
+from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import quote
 
@@ -245,3 +247,41 @@ def requests_on(client: OmlxClient, model_id: str, status: dict) -> int:
     others = sum(model_load(m) for m in (activity.get("active_models") or {}).get("models") or []
                  if m.get("id") != model_id)
     return max(0, total - others)
+
+
+LOG_DIR = Path.home() / ".omlx" / "logs"
+_REJECTED = re.compile(r"omlx\.server - WARNING - .* - POST /v1/\S+ → [45]\d\d")
+
+
+class RejectedRequests:
+    """Counts API requests oMLX turned away, from its server log.
+
+    A request oMLX rejects outright (e.g. HTTP 507 because a benchmark holds
+    the memory it would need to load a model) is never in flight and never
+    counts in /api/status, so it is invisible to every other signal. oMLX logs
+    each one as `POST /v1/... → 5xx`. `new()` returns how many appeared since
+    the previous call; the first call only sets the starting point.
+    """
+
+    def __init__(self, path: Path = LOG_DIR / "server.log"):
+        self.path = path
+        self.inode: int | None = None
+        self.offset = 0
+
+    def new(self) -> int:
+        try:
+            st = self.path.stat()
+            if self.inode is None:
+                self.inode, self.offset = st.st_ino, st.st_size
+                return 0
+            if st.st_ino != self.inode or st.st_size < self.offset:
+                self.inode, self.offset = st.st_ino, 0  # rotated
+            with self.path.open("rb") as f:
+                f.seek(self.offset)
+                chunk = f.read()
+        except OSError:
+            return 0
+        # Count whole lines only; a partial last line is read next time.
+        complete = chunk[: chunk.rfind(b"\n") + 1]
+        self.offset += len(complete)
+        return len(_REJECTED.findall(complete.decode(errors="replace")))

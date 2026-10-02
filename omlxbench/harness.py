@@ -20,11 +20,12 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 
 import httpx
 
 from . import bfcl
-from .client import NET_ERRORS, OmlxClient, in_flight
+from .client import NET_ERRORS, OmlxClient, RejectedRequests, in_flight
 from .control import pause_state
 from .db import DB, dumps, now
 from .planner import WorkUnit
@@ -54,6 +55,10 @@ class _Harness:
         self.cancel_reason: str | None = None
         self.baseline = 0
         self.ours_completed = 0
+        self.rejected = RejectedRequests()
+        self.rejected.new()  # start counting from here
+        self.rejected_total = 0
+        self.ours_rejected = 0  # our own non-2xx responses also appear in the log
 
     # -- yielding -----------------------------------------------------------
 
@@ -70,6 +75,9 @@ class _Harness:
         loaded = status.get("loaded_models") or []
         if (status.get("total_requests") or 0) - self.baseline > self.ours_completed:
             return "user_traffic"
+        self.rejected_total += self.rejected.new()
+        if self.rejected_total > self.ours_rejected:
+            return "user_traffic"  # oMLX turned someone else's request away
         if in_flight(status) > ours_in_flight:
             return "user_traffic"
         if status.get("models_loading") and self.model.model_id in loaded:
@@ -78,19 +86,55 @@ class _Harness:
 
     # -- one request ----------------------------------------------------------
 
-    def chat(self, body: dict) -> dict:
-        """POST a chat completion, polling for a reason to yield meanwhile.
+    def chat(self, body: dict) -> httpx.Response:
+        """POST a chat completion (non-streaming)."""
+        return self._abandonable(lambda http: http.post("/v1/chat/completions", json=body))
 
-        The request runs on a worker thread with its own HTTP client; closing
-        that client drops the connection, which oMLX treats as a cancel.
+    def chat_first_token(self, body: dict) -> dict:
+        """Stream a chat completion and time its first token client-side.
+
+        Returns {"ttft": seconds or None, "usage": dict or None, "error":
+        str or None}. Streaming keeps the timing even when oMLX ends the
+        response with an error (e.g. `incomplete_tool_call` when a reply is
+        cut off inside a tool call), which a non-streaming request loses.
         """
+        body = {**body, "stream": True, "stream_options": {"include_usage": True}}
+
+        def stream(http: httpx.Client) -> dict:
+            out: dict = {"ttft": None, "usage": None, "error": None}
+            t0 = time.monotonic()
+            with http.stream("POST", "/v1/chat/completions", json=body) as resp:
+                if resp.status_code >= 400:
+                    resp.read()
+                    out["error"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
+                    return out
+                for line in resp.iter_lines():
+                    if not line.startswith("data:") or line.strip() == "data: [DONE]":
+                        continue
+                    chunk = json.loads(line[5:])
+                    if "error" in chunk:
+                        out["error"] = json.dumps(chunk["error"])[:300]
+                    out["usage"] = chunk.get("usage") or out["usage"]
+                    delta = ((chunk.get("choices") or [{}])[0].get("delta") or {})
+                    if out["ttft"] is None and any(delta.get(k) for k in
+                                                   ("content", "reasoning_content", "reasoning",
+                                                    "tool_calls")):
+                        out["ttft"] = time.monotonic() - t0
+            return out
+
+        return self._abandonable(stream)
+
+    def _abandonable(self, request):
+        """Run `request(http)` on a worker thread, polling for a reason to
+        yield meanwhile. The worker has its own HTTP client; closing it drops
+        the connection, which oMLX treats as a cancel of just our request."""
         http = httpx.Client(base_url=self.client.base_url, timeout=REQUEST_TIMEOUT_SECONDS,
                             headers={"Authorization": f"Bearer {self.client.api_key}"})
         box: dict = {}
 
         def worker():
             try:
-                box["resp"] = http.post("/v1/chat/completions", json=body)
+                box["result"] = request(http)
             except Exception as e:  # noqa: BLE001 - surfaced below
                 box["exc"] = e
 
@@ -106,7 +150,7 @@ class _Harness:
             http.close()
         if "exc" in box:
             raise box["exc"]
-        return box["resp"]
+        return box["result"]
 
     def finish(self, status: str, error: str | None, recorded: int, total: int) -> None:
         self.db.finish_run(self.run_id, status=status, cancel_reason=self.cancel_reason,
@@ -160,6 +204,7 @@ class ToolsExecution(_Harness):
                 if resp.is_success:
                     self.ours_completed += 1
                 else:
+                    self.ours_rejected += 1
                     self.rebaseline()  # unclear whether oMLX counted a rejected request
                 if i % 10 == 0:
                     log.info("  %s: %d/%d done", p["category"], len(done) + i, len(cases))
@@ -239,6 +284,7 @@ class AgentTurnsExecution(_Harness):
                           "messages": [{"role": "user", "content": "Reply with OK."}]}).is_success:
                 self.ours_completed += 1
             else:
+                self.ours_rejected += 1
                 self.rebaseline()  # unclear whether oMLX counted a rejected request
             for step, messages in enumerate(requests, 1):
                 if reason := self.should_yield(ours_in_flight=0):
@@ -249,12 +295,12 @@ class AgentTurnsExecution(_Harness):
                         "enable_thinking": thinking}
                 if thinking:
                     body["reasoning_effort"] = "medium"
-                resp = self.chat(body)
-                if not resp.is_success or "error" in (data := resp.json()):
-                    # oMLX can return 200 with an error body (e.g. incomplete_tool_call)
-                    raise OmlxStepError(f"step {step}: HTTP {resp.status_code}: {resp.text[:300]}")
+                result = self.chat_first_token(body)
+                if result["ttft"] is None:
+                    self.ours_rejected += bool(result["error"])
+                    raise OmlxStepError(f"step {step}: no tokens: {result['error']}")
                 self.ours_completed += 1
-                self.record(step, data)
+                self.record(step, result)
                 recorded += 1
         except _Aborted:
             status = "cancelled"
@@ -272,21 +318,24 @@ class AgentTurnsExecution(_Harness):
                               environment_hash=self.env_hash)
         self.finish(status, error, recorded, agent_turns.STEPS)
 
-    def record(self, step: int, data: dict) -> None:
-        u = data.get("usage") or {}
-        prompt = u.get("prompt_tokens") or 0
-        cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
-        log.info("  step %d: %d prompt tokens, ttft %.1fs", step, prompt,
-                 u.get("time_to_first_token") or 0)
+    def record(self, step: int, result: dict) -> None:
+        u = result["usage"] or {}
+        # oMLX's own TTFT when it reported usage; ours otherwise (an error
+        # ending, e.g. a reply cut off inside a tool call, has no usage).
+        ttft = u.get("time_to_first_token") or result["ttft"]
+        prompt = u.get("prompt_tokens")
+        log.info("  step %d: %s prompt tokens, ttft %.1fs%s", step, prompt, ttft,
+                 f" ({result['error']})" if result["error"] else "")
         self.db.x(
             "INSERT INTO agent_turns(run_id, model_id, spec_key, settings_fingerprint, step,"
             " prompt_tokens, cached_tokens, completion_tokens, time_to_first_token,"
             " prompt_tps, generation_tps, total_time, raw_json, recorded_at)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             self.run_id, self.model.model_id, self.spec.key, self.model.settings_fingerprint,
-            step, prompt, cached, u.get("completion_tokens"), u.get("time_to_first_token"),
-            u.get("prompt_tokens_per_second"), u.get("generation_tokens_per_second"),
-            u.get("total_time"), dumps(data), now(),
+            step, prompt, (u.get("prompt_tokens_details") or {}).get("cached_tokens"),
+            u.get("completion_tokens"), ttft, u.get("prompt_tokens_per_second"),
+            u.get("generation_tokens_per_second"), u.get("total_time"),
+            dumps({**result, "client_ttft": result["ttft"]}), now(),
         )
 
 

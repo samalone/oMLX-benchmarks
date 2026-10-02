@@ -291,28 +291,7 @@ LEFT JOIN model_snapshots m ON m.id = (SELECT max(id) FROM model_snapshots
 GROUP BY t.model_id, t.settings_fingerprint, t.spec_key;
 """
 
-_SCHEMA_V4 = """
--- Hermes-shaped agent conversation replays: one row per measured step.
--- Only runs with every step present are complete measurements.
-CREATE TABLE agent_turns (
-    id INTEGER PRIMARY KEY,
-    run_id INTEGER NOT NULL REFERENCES runs(id),
-    model_id TEXT NOT NULL,
-    spec_key TEXT NOT NULL,
-    settings_fingerprint TEXT NOT NULL,
-    step INTEGER NOT NULL,
-    prompt_tokens INTEGER,
-    cached_tokens INTEGER,             -- served from oMLX's prefix cache
-    completion_tokens INTEGER,
-    time_to_first_token REAL,          -- seconds
-    prompt_tps REAL,                   -- prefill speed over the uncached tokens
-    generation_tps REAL,
-    total_time REAL,
-    raw_json TEXT NOT NULL,
-    recorded_at TEXT NOT NULL,
-    UNIQUE (run_id, step)
-);
-
+_V_AGENT_TURNS = """
 -- One row per complete replay (run finished with every step). oMLX's
 -- reported cached_tokens is rounded to 4096-token cache blocks, so new
 -- tokens per step are taken as the growth of the prompt instead: each step's
@@ -340,8 +319,37 @@ FROM s
 GROUP BY run_id;
 """
 
-# Each entry upgrades the schema by one version. Append; never edit old ones.
-MIGRATIONS: list[str] = [_SCHEMA_V1, _SCHEMA_V2, _SCHEMA_V3, _SCHEMA_V4]
+_SCHEMA_V4 = """
+-- Hermes-shaped agent conversation replays: one row per measured step.
+-- Only runs with every step present are complete measurements.
+CREATE TABLE agent_turns (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    model_id TEXT NOT NULL,
+    spec_key TEXT NOT NULL,
+    settings_fingerprint TEXT NOT NULL,
+    step INTEGER NOT NULL,
+    prompt_tokens INTEGER,
+    cached_tokens INTEGER,             -- served from oMLX's prefix cache
+    completion_tokens INTEGER,
+    time_to_first_token REAL,          -- seconds
+    prompt_tps REAL,                   -- prefill speed over the uncached tokens
+    generation_tps REAL,
+    total_time REAL,
+    raw_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    UNIQUE (run_id, step)
+);
+
+"""
+
+
+# v5: databases that ran a draft of v4 got an older v_agent_turns.
+_SCHEMA_V5 = "DROP VIEW IF EXISTS v_agent_turns;\n" + _V_AGENT_TURNS
+
+# Each entry upgrades the schema by one version. Append; never edit old ones
+# (v4's view moved to _V_AGENT_TURNS, applied by v5 for every database).
+MIGRATIONS: list[str] = [_SCHEMA_V1, _SCHEMA_V2, _SCHEMA_V3, _SCHEMA_V4, _SCHEMA_V5]
 
 
 class DB:

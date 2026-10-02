@@ -29,7 +29,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from .client import NET_ERRORS, EventPump, OmlxClient, OmlxError, in_flight, requests_on
+from .client import (NET_ERRORS, EventPump, OmlxClient, OmlxError, RejectedRequests,
+                     in_flight, requests_on)
 from .control import daemon_alive, pause_state
 from .db import DB, dumps, now
 from .importer import ImportState, import_ui
@@ -81,10 +82,12 @@ class TrafficWatch:
 
     last_total: int | None = None
     last_activity: float = field(default_factory=time.monotonic)
+    rejected: RejectedRequests = field(default_factory=RejectedRequests)
 
     def observe(self, status: dict) -> None:
         total = status.get("total_requests")
-        if total != self.last_total or in_flight(status) or status.get("models_loading"):
+        if (total != self.last_total or in_flight(status) or status.get("models_loading")
+                or self.rejected.new()):
             self.touch()
         self.last_total = total
 
@@ -290,6 +293,7 @@ class Runner:
 class _Observation:
     paused: bool
     completed: int  # API requests completed since the run started
+    rejected: int   # API requests oMLX turned away since the run started (e.g. 507)
     foreign: bool   # another model loaded/loading while the benchmark should be alone
     guests: int     # user requests in flight on the benchmark's model
 
@@ -317,6 +321,8 @@ class _Execution:
         # Yield state machine: running -> waiting (for a user request on our
         # model to finish) -> cancelling. See step().
         self.state = "running"
+        self.rejected = RejectedRequests()
+        self.rejected_total = 0
         self.cancel_reason: str | None = None
         self.surplus_since: float | None = None
         self.wait_reason: str | None = None
@@ -344,6 +350,7 @@ class _Execution:
     def run(self) -> None:
         try:
             self.baseline = self.client.status().get("total_requests") or 0
+            self.rejected.new()  # start counting from here
             self.start()
         except NET_ERRORS as e:
             self.db.finish_run(self.run_id, status="error", error=str(e))
@@ -423,11 +430,13 @@ class _Execution:
             guests = requests_on(self.client, self.unit.model.model_id, status) - self.own_requests()
         except NET_ERRORS:
             return None
+        self.rejected_total += self.rejected.new()
         steady = self.own_requests() > 0
         others = [m for m in status.get("loaded_models") or [] if m != self.unit.model.model_id]
         return _Observation(
             paused=pause_state(self.db)[0],
             completed=(status.get("total_requests") or 0) - self.baseline,
+            rejected=self.rejected_total,
             foreign=steady and bool(others or status.get("models_loading")),
             guests=guests,
         )
@@ -435,8 +444,8 @@ class _Execution:
     def step(self) -> None:
         """One poll of the yield state machine.
 
-        running: yield on a pause, a completed API request, another model
-          being loaded, or a surplus request on our model that persists
+        running: yield on a pause, a completed or rejected API request,
+          another model being loaded, or a surplus request on our model that persists
           (requests linger briefly at test boundaries). If a user request is
           on our model, go to waiting instead of cancelling.
         waiting: cancel once every user request seen has completed. If the
@@ -453,7 +462,7 @@ class _Execution:
             else:
                 self.surplus_since = None
             reason = ("paused" if o.paused else
-                      "user_traffic" if o.completed > 0 or o.foreign else
+                      "user_traffic" if o.completed > 0 or o.rejected > 0 or o.foreign else
                       "user_traffic" if self.surplus_since and t - self.surplus_since >= GUEST_DEBOUNCE_SECONDS
                       else None)
             if reason is None:

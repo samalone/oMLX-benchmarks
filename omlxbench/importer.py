@@ -18,9 +18,8 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 
-from .client import OmlxClient, OmlxError
+from .client import LOG_DIR, OmlxClient, OmlxError
 from .db import DB
 from .snapshot import State, accuracy_identity, capture_state
 from .specs import accuracy, perf_spec_from_result
@@ -28,7 +27,6 @@ from .specs import accuracy, perf_spec_from_result
 log = logging.getLogger("omlxbench")
 
 _BENCH_ID = re.compile(r"\bbench-[0-9a-f]{12}\b")
-LOG_DIR = Path.home() / ".omlx" / "logs"
 
 
 @dataclass
