@@ -229,3 +229,19 @@ class EventPump:
             self.queue.put((self.EOF, exc))
         else:
             self.queue.put((self.EOF, None))
+
+
+def requests_on(client: OmlxClient, model_id: str, status: dict) -> int:
+    """Requests in flight on `model_id`, including ones queued behind a prefill.
+
+    /api/status counts every engine's requests (queued ones too) but not per
+    model; /activity is per model but misses queued requests. So: the status
+    total minus the other models' /activity counts.
+    """
+    total = in_flight(status)
+    if not total or not any(m != model_id for m in status.get("loaded_models") or []):
+        return total
+    activity = client.admin("GET", "/activity")
+    others = sum(model_load(m) for m in (activity.get("active_models") or {}).get("models") or []
+                 if m.get("id") != model_id)
+    return max(0, total - others)

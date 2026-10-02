@@ -10,7 +10,7 @@ def digest(db: DB) -> dict:
 
     def entry(model_id: str) -> dict:
         return models.setdefault(model_id, {"model_id": model_id, "perf": [], "accuracy": [],
-                                            "context": []})
+                                            "tools": [], "context": []})
 
     for m in db.q(
         "SELECT * FROM model_snapshots s WHERE s.id = (SELECT max(id) FROM model_snapshots"
@@ -27,6 +27,7 @@ def digest(db: DB) -> dict:
             "current_settings_fingerprint": m["settings_fingerprint"],
             "perf": [],
             "accuracy": [],
+            "tools": [],
             "context": [],
         }
 
@@ -49,6 +50,14 @@ def digest(db: DB) -> dict:
             "truncated": a["truncated_count"], "time_s": _r(a["time_s"], 0),
             "settings": a["settings_fingerprint"], "omlx": a["omlx_version"],
             "measured": a["recorded_at"],
+        })
+
+    for t in db.q("SELECT * FROM v_tools ORDER BY model_id, category"):
+        entry(t["model_id"])["tools"].append({
+            "category": t["category"], "n": t["n"], "accuracy": _r(t["accuracy"], 4),
+            "avg_completion_tokens": _r(t["avg_completion_tokens"], 0),
+            "avg_time_s": _r(t["avg_time_s"], 1), "settings": t["settings_fingerprint"],
+            "measured": t["recorded_at"],
         })
 
     for c in db.q("SELECT * FROM v_context ORDER BY model_id, recorded_at"):
@@ -80,7 +89,7 @@ def markdown(d: dict) -> str:
         out.append(f"# oMLX benchmarks — {hw['chip']}, {hw['memory_gb']} GB, macOS {hw['macos']}, "
                    f"oMLX {hw['omlx']}\n")
     for m in d["models"]:
-        if not (m["perf"] or m["accuracy"] or m["context"]):
+        if not (m["perf"] or m["accuracy"] or m["tools"] or m["context"]):
             continue
         bits = m.get("quant_bits")
         out.append(f"## {m['model_id']}")
@@ -98,6 +107,12 @@ def markdown(d: dict) -> str:
             for a in m["accuracy"]:
                 out.append(f"| {a['suite']} | {a['n']} | {100 * (a['accuracy'] or 0):.1f}% | "
                            f"{a['thinking']} | {a['settings']} |")
+        if m["tools"]:
+            out.append("\n| tool calling | n | accuracy | avg s |")
+            out.append("|---|---|---|---|")
+            for t in m["tools"]:
+                out.append(f"| {t['category']} | {t['n']} | {100 * (t['accuracy'] or 0):.1f}% | "
+                           f"{t['avg_time_s']} |")
         for c in m["context"]:
             out.append(f"\nMax verified context: {c['verified_tokens']} tokens "
                        f"(target {c['target_tokens']}, capped by {c['capped_by']})")

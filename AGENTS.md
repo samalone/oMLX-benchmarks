@@ -41,6 +41,7 @@ For anything the digest doesn't answer, query the database directly:
 | `v_perf` | Every speed result ever recorded (history, repeats). |
 | `v_latest_accuracy`, `v_accuracy` | Same for intelligence (accuracy) suites. |
 | `v_context` | Largest prompt the machine could actually prefill, per model. |
+| `v_tools`, `tool_cases` | Tool calling (BFCL v3, run by omlxbench through the chat API, thinking on): accuracy per category, and each case with the parsed calls, the reason for a failure, and the raw response. |
 | `accuracy_questions` | Per-question results: expected, predicted, raw response, tokens, time. |
 | `model_snapshots` | Model metadata: architecture (`arch`), `quant_bits`, `size_bytes`, `native_context`, full `settings_json` and `config_json`. |
 | `environments` | Hardware, macOS, oMLX and mlx-lm versions, perf-relevant global settings. |
@@ -86,6 +87,16 @@ or treat each fingerprint as a separate option. Full settings are in
 `model_snapshots.settings_json`.
 
 ## Caveats when drawing conclusions
+
+- **Sampling.** Intelligence (tier 4) and tool-calling results use each model's own
+  recommended sampling (saved in oMLX's per-model settings, which is also what Hermes
+  gets), not greedy decoding. Scores therefore vary a little between runs; treat gaps of
+  a few points as ties. Older rows with `sampling_profile = 'deterministic'` are greedy.
+- **Tool calling** is graded like BFCL: exact function, no unknown arguments, values
+  matching an accepted answer. A failure `reason` containing "parser did not extract
+  it" means the model produced a tool call as text that oMLX's parser missed. That is
+  a model/template/parser compatibility problem worth knowing about separately from
+  model quality.
 
 - **Each speed figure is a single trial.** Differences under ~5% are noise. If repeated
   runs exist in `v_perf`, use the median.

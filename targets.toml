@@ -1,7 +1,7 @@
 # What omlxbench should measure. Edit freely: adding a test or model creates
 # new work; removing one only stops future runs (stored results are kept).
 #
-# Each [[benchmarks]] block may hold `perf`, `accuracy` and/or `context`
+# Each [[benchmarks]] block may hold `perf`, `accuracy`, `context` and/or `tools`
 # tables, and optionally `models` / `exclude_models` globs that narrow it.
 # Lower tiers are completed for every model before any higher tier starts.
 #
@@ -33,16 +33,30 @@ context = { target_tokens = 131072 }
 # Devstral ran at 15 tok/s at 4k context in tier 1: far too slow for an agent.
 exclude_models = ["Devstral-*"]
 
-# Tier 3: capability in the mode Hermes uses (thinking on). Comparing the
+# Sampling: since 2026-10-02 every model has its recommended temperature /
+# top_p / top_k saved in oMLX's per-model settings (from its
+# generation_config.json; Qwen-family thinking values where the model shipped
+# none or non-thinking ones). Hermes sends no sampling parameters, so it gets
+# these; the suites below use them too ("model_settings" / no overrides).
+# Greedy decoding with thinking on makes Qwen-family models loop.
+
+# Tier 3: tool calling (BFCL v3) through oMLX's chat API with thinking on,
+# exactly as Hermes calls the model. The criterion that matters most.
+[[benchmarks]]
+tier = 3
+tools = { categories = { simple = 40, multiple = 40, parallel = 40, parallel_multiple = 40, irrelevance = 40 }, enable_thinking = true }
+exclude_models = ["Devstral-*"]
+
+# Tier 4: capability in the mode Hermes uses (thinking on). Comparing the
 # abliterated/uncensored variants with their siblings shows what uncensoring
 # costs.
 [[benchmarks]]
-tier = 3
-accuracy = { suites = { gsm8k = 100, mmlu_pro = 300, humaneval = 0, mbpp = 200 }, enable_thinking = true }
+tier = 4
+accuracy = { suites = { gsm8k = 100, mmlu_pro = 300, humaneval = 0, mbpp = 200 }, enable_thinking = true, sampling_profile = "model_settings" }
 exclude_models = ["Devstral-*"]
 
 # Later, for finalists only (thinking on, ~16k tokens per question):
 # [[benchmarks]]
-# tier = 5
+# tier = 6
 # accuracy = { suites = { livecodebench = 100 }, enable_thinking = true }
 # models = ["..."]

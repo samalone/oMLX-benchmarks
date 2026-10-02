@@ -14,7 +14,8 @@ from .client import NET_ERRORS, OmlxClient
 from .config import load_config
 from .db import DB
 from .planner import iter_targets, plan, spec_state
-from .runner import Runner, cancel_orphan, clear_pause, daemon_alive, pause_state, set_pause
+from .control import clear_pause, daemon_alive, pause_state, set_pause
+from .runner import Runner, cancel_orphan
 from .snapshot import capture_environment, snapshot_model
 from .specs import load_targets
 

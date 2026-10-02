@@ -29,7 +29,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from .client import NET_ERRORS, EventPump, OmlxClient, OmlxError, in_flight, model_load
+from .client import NET_ERRORS, EventPump, OmlxClient, OmlxError, in_flight, requests_on
+from .control import daemon_alive, pause_state
 from .db import DB, dumps, now
 from .importer import ImportState, import_ui
 from .planner import WorkUnit, plan
@@ -55,61 +56,7 @@ IMPORT_INTERVAL_SECONDS = 600
 _OWN_REQUESTS = {"warmup": 1, "single": 1, "calibrate": 1, "estimate": 1, "verify": 1}
 
 
-# -- pause control (shared with the CLI through the database) ---------------
-
-
-def pause_state(db: DB) -> tuple[bool, str | None]:
-    """(paused, description)."""
-    until = db.get_control("paused_until")
-    if not until:
-        return False, None
-    reason = db.get_control("pause_reason") or ""
-    if until == "forever":
-        return True, f"paused until resumed {reason}".strip()
-    if datetime.fromisoformat(until) > datetime.now(timezone.utc):
-        return True, f"paused until {until} {reason}".strip()
-    db.set_control("paused_until", None)
-    return False, None
-
-
-def set_pause(db: DB, until: datetime | None, reason: str = "") -> None:
-    db.set_control("paused_until", until.isoformat(timespec="seconds") if until else "forever")
-    db.set_control("pause_reason", reason or None)
-
-
-def clear_pause(db: DB) -> None:
-    db.set_control("paused_until", None)
-    db.set_control("pause_reason", None)
-
-
-def daemon_alive(db: DB) -> int | None:
-    pid = db.get_control("daemon_pid")
-    if not pid:
-        return None
-    try:
-        os.kill(int(pid), 0)
-    except (OSError, ValueError):
-        return None
-    return int(pid)
-
-
 # -- observing the server ----------------------------------------------------
-
-
-def requests_on(client: OmlxClient, model_id: str, status: dict) -> int:
-    """Requests in flight on `model_id`, including ones queued behind a prefill.
-
-    /api/status counts every engine's requests (queued ones too) but not per
-    model; /activity is per model but misses queued requests. So: the status
-    total minus the other models' /activity counts.
-    """
-    total = in_flight(status)
-    if not total or not any(m != model_id for m in status.get("loaded_models") or []):
-        return total
-    activity = client.admin("GET", "/activity")
-    others = sum(model_load(m) for m in (activity.get("active_models") or {}).get("models") or []
-                 if m.get("id") != model_id)
-    return max(0, total - others)
 
 
 def cancel_orphan(client: OmlxClient, kind: str, bench_id: str | None, model_id: str,
@@ -310,6 +257,18 @@ class Runner:
             model_snapshot_id=state.snapshot_ids.get(unit.model.model_id),
             environment_id=state.env_id, request=request, spec_keys=[s.key for s in unit.specs],
         )
+        if unit.kind == "tools":
+            from .harness import ToolsExecution
+
+            harness = ToolsExecution(self.client, self.db, unit, state.env.hash, run_id)
+            try:
+                harness.run()  # closing our connection on the way out cancels cleanly
+            except (KeyboardInterrupt, _Shutdown):
+                self.db.finish_run(run_id, status="cancelled", cancel_reason="shutdown")
+                raise
+            if harness.cancel_reason == "user_traffic":
+                self.traffic.touch()
+            return
         exec_ = _Execution(self.client, self.db, unit, state.env.hash, run_id, request)
         try:
             exec_.run()

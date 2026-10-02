@@ -47,6 +47,8 @@ class WorkUnit:
                 "enable_thinking": p["enable_thinking"],
                 "sampling_profile": p["sampling_profile"],
             }
+        if self.kind == "tools":
+            return {"model_id": model_id, **self.specs[0].p}
         return {"model_id": model_id, "target_tokens": self.specs[0].p["target_tokens"]}
 
     def describe(self) -> str:
@@ -117,6 +119,6 @@ def _group(tier: int, model: ModelSnapshot, specs: list[Spec]) -> list[WorkUnit]
         if s.run_kind == "accuracy":
             units.append(WorkUnit(tier, model, "accuracy", [s]))
     for s in specs:
-        if s.run_kind == "context":
-            units.append(WorkUnit(tier, model, "context", [s]))
+        if s.run_kind in ("context", "tools"):
+            units.append(WorkUnit(tier, model, s.run_kind, [s]))
     return units

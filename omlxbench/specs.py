@@ -62,6 +62,10 @@ class Spec:
             n = p["sample_size"] or "full"
             think = " thinking" if p["enable_thinking"] else ""
             return f"{p['suite']} n={n}{think}"
+        if self.kind == "tools":
+            n = p["sample_size"] or "all"
+            think = " thinking" if p["enable_thinking"] else ""
+            return f"tools {p['category']} n={n}{think}"
         return f"context {p['target_tokens']}"
 
 
@@ -93,6 +97,12 @@ def accuracy(suite: str, sample_size: int, enable_thinking: bool = False,
     return Spec.make("accuracy", suite=suite, sample_size=sample_size,
                      enable_thinking=enable_thinking, sampling_profile=sampling_profile,
                      batch_size=batch_size)
+
+
+def tools(category: str, sample_size: int, enable_thinking: bool = True) -> Spec:
+    """BFCL v3 tool-calling category, run through oMLX's chat API."""
+    return Spec.make("tools", suite="bfcl_v3", category=category, sample_size=sample_size,
+                     enable_thinking=enable_thinking)
 
 
 def context(target_tokens: int) -> Spec:
@@ -169,6 +179,17 @@ def _accuracy_specs(cfg: dict) -> list[Spec]:
     return specs
 
 
+def _tools_specs(cfg: dict) -> list[Spec]:
+    from .bfcl import CATEGORIES
+
+    thinking = bool(cfg.get("enable_thinking", True))
+    specs = []
+    for category, n in cfg.get("categories", {}).items():
+        _check(category, set(CATEGORIES), "tools category")
+        specs.append(tools(category, int(n), thinking))
+    return specs
+
+
 def _context_specs(cfg: dict) -> list[Spec]:
     targets = cfg.get("target_tokens", [])
     if isinstance(targets, int):
@@ -190,6 +211,8 @@ def load_targets(path: Path) -> Targets:
             specs += _accuracy_specs(b["accuracy"])
         if "context" in b:
             specs += _context_specs(b["context"])
+        if "tools" in b:
+            specs += _tools_specs(b["tools"])
         if not specs:
             raise ValueError(f"targets.toml: [[benchmarks]] #{i + 1} defines no tests")
         groups.append(TargetGroup(

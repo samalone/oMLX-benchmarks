@@ -16,7 +16,6 @@ which is right unless the model's settings changed since the run.
 from __future__ import annotations
 
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path

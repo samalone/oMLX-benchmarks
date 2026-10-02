@@ -254,8 +254,45 @@ ALTER TABLE accuracy_results ADD COLUMN identity TEXT;
 CREATE INDEX accuracy_results_identity ON accuracy_results(identity);
 """
 
+_SCHEMA_V3 = """
+-- Per-case results of harness suites (run by omlxbench itself through the
+-- chat API, not by oMLX's built-in benchmarks). Cases are recorded one by
+-- one so an interrupted suite resumes where it stopped.
+CREATE TABLE tool_cases (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    model_id TEXT NOT NULL,
+    spec_key TEXT NOT NULL,
+    settings_fingerprint TEXT NOT NULL,
+    category TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    correct INTEGER NOT NULL,
+    reason TEXT,
+    tool_calls_json TEXT,              -- parsed calls (BFCL names), NULL if unparseable
+    content TEXT,                      -- assistant text, if any
+    finish_reason TEXT,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    time_to_first_token REAL,          -- seconds, from oMLX usage
+    total_time REAL,
+    raw_json TEXT NOT NULL,            -- full response
+    recorded_at TEXT NOT NULL,
+    UNIQUE (model_id, spec_key, settings_fingerprint, case_id)
+);
+
+CREATE VIEW v_tools AS
+SELECT t.model_id, t.settings_fingerprint, t.spec_key, t.category,
+       count(*) AS n, sum(t.correct) AS correct, avg(t.correct) AS accuracy,
+       avg(t.completion_tokens) AS avg_completion_tokens, avg(t.total_time) AS avg_time_s,
+       max(t.recorded_at) AS recorded_at, m.quant_bits, m.size_bytes
+FROM tool_cases t
+LEFT JOIN model_snapshots m ON m.id = (SELECT max(id) FROM model_snapshots
+                                       WHERE model_id = t.model_id)
+GROUP BY t.model_id, t.settings_fingerprint, t.spec_key;
+"""
+
 # Each entry upgrades the schema by one version. Append; never edit old ones.
-MIGRATIONS: list[str] = [_SCHEMA_V1, _SCHEMA_V2]
+MIGRATIONS: list[str] = [_SCHEMA_V1, _SCHEMA_V2, _SCHEMA_V3]
 
 
 class DB:
