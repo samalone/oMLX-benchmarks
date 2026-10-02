@@ -1,0 +1,39 @@
+# What omlxbench should measure. Edit freely: adding a test or model creates
+# new work; removing one only stops future runs (stored results are kept).
+#
+# Each [[benchmarks]] block may hold `perf`, `accuracy` and/or `context`
+# tables, and optionally `models` / `exclude_models` globs that narrow it.
+# Lower tiers are completed for every model before any higher tier starts.
+
+[runner]
+quiet_minutes = 10        # no API traffic for this long before a run starts
+
+[models]
+include = ["*"]           # glob patterns against oMLX model ids
+exclude = []
+types = ["llm", "vlm"]
+
+# Tier 1: the oMLX web UI defaults. A quick speed baseline for every model.
+[[benchmarks]]
+tier = 1
+perf = { prompt_lengths = [1024, 4096], batch_sizes = [2, 4], context_profile = "code_python" }
+
+# Tier 2: a cheap intelligence baseline (thinking off, greedy).
+[[benchmarks]]
+tier = 2
+accuracy = { suites = { mmlu = 300, gsm8k = 100, humaneval = 0 } }
+
+# Tier 3: long-prompt speed, and the largest prompt memory allows.
+[[benchmarks]]
+tier = 3
+perf = { prompt_lengths = [16384, 32768] }
+context = { target_tokens = 131072 }
+
+# Tier 4: broader intelligence coverage.
+[[benchmarks]]
+tier = 4
+accuracy = { suites = { mmlu = 1000, truthfulqa = 0, mbpp = 200, livecodebench = 100 } }
+
+# Ideas for later:
+# perf = { prompt_lengths = [65536, 131072] }
+# accuracy = { suites = { gsm8k = 100, mmlu_pro = 300 }, enable_thinking = true }
