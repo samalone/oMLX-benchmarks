@@ -94,6 +94,12 @@ def import_ui(client: OmlxClient, db: DB, extra_ids: list[str] = ()) -> int:
                                         r.get("correct"), r.get("time_s")])
         if db.q1("SELECT 1 FROM runs WHERE kind='accuracy' AND omlx_bench_id=?", pseudo_id):
             continue
+        # Suites the runner itself recorded are in oMLX's list too.
+        if db.q1("SELECT 1 FROM accuracy_results a JOIN runs r ON r.id = a.run_id"
+                 " WHERE r.model_id=? AND a.suite=? AND a.total IS ? AND a.correct IS ?"
+                 " AND a.time_s IS ?", model_id, r.get("benchmark"), r.get("total"),
+                 r.get("correct"), r.get("time_s")):
+            continue
         total, dataset_total = r.get("total") or 0, r.get("dataset_total") or 0
         sample_size = 0 if dataset_total and total >= dataset_total else total
         spec = accuracy(r["benchmark"], sample_size, bool(r.get("thinking_used")),

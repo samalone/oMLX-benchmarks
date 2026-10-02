@@ -35,7 +35,7 @@ def digest(db: DB) -> dict:
             "test": "single" if p["test_type"] == "single" else f"batch{p['batch_size']}",
             "pp": p["pp"], "tg": p["tg"], "context_profile": p["context_profile"],
             "pp_tps": _r(p["processing_tps"]), "tg_tps": _r(p["gen_tps"]),
-            "ttft_ms": _r(p["ttft_ms"], 0), "e2e_s": _r(p["e2e_latency_s"], 2),
+            "ttft_ms": _r(p["ttft_ms"] if p["ttft_ms"] is not None else p["avg_ttft_ms"], 0), "e2e_s": _r(p["e2e_latency_s"], 2),
             "peak_mem_gb": _r((p["peak_memory_bytes"] or 0) / 2**30, 2),
             "settings": p["settings_fingerprint"], "omlx": p["omlx_version"],
             "measured": p["recorded_at"],

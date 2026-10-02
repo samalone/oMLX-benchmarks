@@ -33,10 +33,12 @@ log = logging.getLogger("omlxbench")
 
 POLL_SECONDS = 2.0
 FAST_POLL_SECONDS = 0.5  # while waiting for a user request to finish
+PHANTOM_GUEST_SECONDS = 15.0
 IDLE_SLEEP_SECONDS = 15.0
 NOTHING_TO_DO_SLEEP_SECONDS = 300.0
 DRAIN_TIMEOUT_SECONDS = 120.0
 USAGE_SNAPSHOT_INTERVAL = timedelta(hours=24)
+IMPORT_INTERVAL_SECONDS = 600
 
 # Benchmark phases during which only the benchmark's own model should be
 # loaded and its own requests in flight. (Unload/load phases are excluded:
@@ -132,6 +134,7 @@ class Runner:
         self.quiet_minutes_override = quiet_minutes
         self.traffic = TrafficWatch()
         self._last_gate_msg: str | None = None
+        self._last_import = float("-inf")
 
     # -- top level --------------------------------------------------------
 
@@ -145,6 +148,7 @@ class Runner:
             self.reconcile_stale_runs()
             while True:
                 self.db.set_control("daemon_heartbeat", now())
+                self.maybe_import_ui()
                 targets: Targets = self.load_targets()
                 quiet_min = (self.quiet_minutes_override
                              if self.quiet_minutes_override is not None else targets.quiet_minutes)
@@ -222,6 +226,18 @@ class Runner:
         self.snapshot_ids = {m.model_id: self.db.upsert_model_snapshot(m) for m in models}
         return env, models
 
+    def maybe_import_ui(self) -> None:
+        """Keep results of runs started from the web UI (oMLX forgets them)."""
+        if time.monotonic() - self._last_import < IMPORT_INTERVAL_SECONDS:
+            return
+        self._last_import = time.monotonic()
+        from .importer import import_ui
+
+        try:
+            import_ui(self.client, self.db)
+        except (OmlxError, OSError) as e:
+            log.warning("import of web-UI results failed: %s", e)
+
     def maybe_snapshot_usage(self) -> None:
         row = self.db.q1("SELECT max(captured_at) AS t FROM usage_snapshots")
         last = row["t"] if row else None
@@ -273,6 +289,8 @@ class Runner:
             return exec_.run()
         except (KeyboardInterrupt, _Shutdown):
             exec_.abort("shutdown")
+            exec_.restore_context_setting()
+            self.db.finish_run(run_id, status="cancelled", cancel_reason="shutdown")
             raise
 
 
@@ -289,6 +307,9 @@ class _Execution:
         self.cancel_reason: str | None = None
         self.yield_pending: str | None = None
         self.guests_seen = 0
+        self.last_guest_seen = 0.0
+        self.surplus_streak = 0
+        self.phantom_cleared = False
         self.phase: str | None = None
         self.terminal: dict | None = None
         self.recorded: set[str] = set()
@@ -371,6 +392,11 @@ class _Execution:
                     self.yield_pending = reason
                     next_check = time.monotonic() + FAST_POLL_SECONDS
                     continue
+                if self.phantom_cleared:
+                    # The surplus turned out to be transient; re-evaluate
+                    # from scratch on the next poll instead of cancelling.
+                    self.phantom_cleared = False
+                    continue
                 self.abort(reason)
                 drain_deadline = time.monotonic() + DRAIN_TIMEOUT_SECONDS
 
@@ -406,8 +432,14 @@ class _Execution:
             if others or status.get("models_loading"):
                 return "user_traffic"
             in_flight = (status.get("active_requests") or 0) + (status.get("waiting_requests") or 0)
+            # Requests linger briefly when one batch test hands over to the
+            # next, so only a surplus seen on consecutive polls counts.
             if in_flight > self.expected_in_flight():
-                return "user_traffic"
+                self.surplus_streak += 1
+                if self.surplus_streak >= 2:
+                    return "user_traffic"
+            else:
+                self.surplus_streak = 0
         return None
 
     def expected_in_flight(self) -> int:
@@ -443,9 +475,21 @@ class _Execution:
         )
         in_flight = (status.get("active_requests") or 0) + (status.get("waiting_requests") or 0)
         guests = in_flight - others - self.expected_in_flight()
-        self.guests_seen = max(self.guests_seen, guests)
         completed = (status.get("total_requests") or 0) - (self.baseline or 0)
-        return guests > 0 or completed < self.guests_seen
+        if guests > 0:
+            self.guests_seen = max(self.guests_seen, completed + guests)
+            self.last_guest_seen = time.monotonic()
+            return True
+        if completed < self.guests_seen:
+            if time.monotonic() - self.last_guest_seen < PHANTOM_GUEST_SECONDS:
+                return True
+            # Nothing in flight for a while and nothing completed: the
+            # "guest" was a transient count, not a user request.
+            log.info("no user request after all; continuing")
+            self.guests_seen = completed
+            self.yield_pending = None
+            self.phantom_cleared = True
+        return False
 
     def abort(self, reason: str) -> None:
         if self.cancel_reason:
