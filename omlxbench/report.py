@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-import json
-
 from .db import DB
 
 
 def digest(db: DB) -> dict:
     models: dict[str, dict] = {}
+
+    def entry(model_id: str) -> dict:
+        return models.setdefault(model_id, {"model_id": model_id, "perf": [], "accuracy": [],
+                                            "context": []})
 
     for m in db.q(
         "SELECT * FROM model_snapshots s WHERE s.id = (SELECT max(id) FROM model_snapshots"
@@ -29,12 +31,11 @@ def digest(db: DB) -> dict:
         }
 
     for p in db.q("SELECT * FROM v_latest_perf ORDER BY model_id, test_type DESC, pp, batch_size"):
-        entry = models.setdefault(p["model_id"], {"model_id": p["model_id"], "perf": [],
-                                                  "accuracy": [], "context": []})
-        entry["perf"].append({
+        entry(p["model_id"])["perf"].append({
             "test": "single" if p["test_type"] == "single" else f"batch{p['batch_size']}",
             "pp": p["pp"], "tg": p["tg"], "context_profile": p["context_profile"],
             "pp_tps": _r(p["processing_tps"]), "tg_tps": _r(p["gen_tps"]),
+            # batch tests report a mean time to first token instead
             "ttft_ms": _r(p["ttft_ms"] if p["ttft_ms"] is not None else p["avg_ttft_ms"], 0), "e2e_s": _r(p["e2e_latency_s"], 2),
             "peak_mem_gb": _r((p["peak_memory_bytes"] or 0) / 2**30, 2),
             "settings": p["settings_fingerprint"], "omlx": p["omlx_version"],
@@ -42,9 +43,7 @@ def digest(db: DB) -> dict:
         })
 
     for a in db.q("SELECT * FROM v_latest_accuracy ORDER BY model_id, suite"):
-        entry = models.setdefault(a["model_id"], {"model_id": a["model_id"], "perf": [],
-                                                  "accuracy": [], "context": []})
-        entry["accuracy"].append({
+        entry(a["model_id"])["accuracy"].append({
             "suite": a["suite"], "n": a["total"], "accuracy": _r(a["accuracy"], 4),
             "thinking": bool(a["thinking_used"]), "sampling": a["sampling_profile"],
             "truncated": a["truncated_count"], "time_s": _r(a["time_s"], 0),
@@ -53,9 +52,7 @@ def digest(db: DB) -> dict:
         })
 
     for c in db.q("SELECT * FROM v_context ORDER BY model_id, recorded_at"):
-        entry = models.setdefault(c["model_id"], {"model_id": c["model_id"], "perf": [],
-                                                  "accuracy": [], "context": []})
-        entry["context"].append({
+        entry(c["model_id"])["context"].append({
             "target_tokens": c["target_tokens"], "verified_tokens": c["verified_tokens"],
             "capped_by": c["capped_by"], "prefill_tps": _r(c["prefill_tps"]),
             "settings": c["settings_fingerprint"], "measured": c["recorded_at"],
@@ -108,5 +105,3 @@ def markdown(d: dict) -> str:
     return "\n".join(out)
 
 
-def as_json(d: dict) -> str:
-    return json.dumps(d, indent=2)

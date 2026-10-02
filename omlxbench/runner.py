@@ -10,7 +10,12 @@ Detecting "real use" (oMLX 0.7.0):
   built-in benchmarks call the engine directly and never move it.
 - A long chat request only shows up there when it finishes, so during a run
   we also watch for models other than the benchmark's being loaded, and for
-  more in-flight requests than the benchmark phase accounts for.
+  more requests in flight on the benchmark's model than the benchmark's own.
+
+Cancelling safely: cancelling makes oMLX unload the benchmark's model with an
+immediate abort, which strands any user request on that same model (it hangs
+and never completes). So every cancel first waits until no user request is in
+flight on the model under test (see `_Execution.cancel_when_clear`).
 """
 
 from __future__ import annotations
@@ -24,27 +29,30 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from .client import NET_ERRORS, EventPump, OmlxClient, OmlxError
+from .client import NET_ERRORS, EventPump, OmlxClient, OmlxError, in_flight, model_load
 from .db import DB, dumps, now
+from .importer import ImportState, import_ui
 from .planner import WorkUnit, plan
-from .snapshot import Environment, ModelSnapshot, capture_environment, snapshot_model
-from .specs import Spec, Targets, accuracy, perf_batch, perf_single
+from .snapshot import State, capture_state
+from .specs import Spec, Targets, perf_spec_from_result
 
 log = logging.getLogger("omlxbench")
 
 POLL_SECONDS = 2.0
-FAST_POLL_SECONDS = 0.5  # while waiting for a user request to finish
-PHANTOM_GUEST_SECONDS = 15.0
+FAST_POLL_SECONDS = 0.5           # while waiting for a user request to finish
+GUEST_DEBOUNCE_SECONDS = 3.0      # a surplus request must persist this long to count
+PHANTOM_GUEST_SECONDS = 15.0      # a "guest" that neither stays nor completes was noise
 IDLE_SLEEP_SECONDS = 15.0
 NOTHING_TO_DO_SLEEP_SECONDS = 300.0
 DRAIN_TIMEOUT_SECONDS = 120.0
+SHUTDOWN_GRACE_SECONDS = 15.0     # launchd sends SIGKILL 20s after SIGTERM
+ORPHAN_GRACE_SECONDS = 120.0
 USAGE_SNAPSHOT_INTERVAL = timedelta(hours=24)
 IMPORT_INTERVAL_SECONDS = 600
 
-# Benchmark phases during which only the benchmark's own model should be
-# loaded and its own requests in flight. (Unload/load phases are excluded:
-# other models legitimately appear there.)
-_STEADY_PHASES = {"warmup", "single", "batch", "eval", "calibrate", "estimate", "verify"}
+# Requests the benchmark itself has in flight, by progress phase. Phases not
+# listed (unload, load, cleanup, upload...) have none.
+_OWN_REQUESTS = {"warmup": 1, "single": 1, "calibrate": 1, "estimate": 1, "verify": 1}
 
 
 # -- pause control (shared with the CLI through the database) ---------------
@@ -74,20 +82,6 @@ def clear_pause(db: DB) -> None:
     db.set_control("pause_reason", None)
 
 
-def cancel_bench(client: OmlxClient, kind: str, bench_id: str | None) -> None:
-    try:
-        if kind == "perf" and bench_id:
-            client.cancel_perf(bench_id)
-        elif kind == "context" and bench_id:
-            client.cancel_context(bench_id)
-        elif kind == "accuracy":
-            client.cancel_accuracy()
-    except OmlxError as e:
-        # 400 = not running any more, which is what we wanted.
-        if e.status != 400:
-            raise
-
-
 def daemon_alive(db: DB) -> int | None:
     pid = db.get_control("daemon_pid")
     if not pid:
@@ -99,22 +93,56 @@ def daemon_alive(db: DB) -> int | None:
     return int(pid)
 
 
-# -- traffic observation ----------------------------------------------------
+# -- observing the server ----------------------------------------------------
+
+
+def requests_on(client: OmlxClient, model_id: str, status: dict) -> int:
+    """Requests in flight on `model_id`, including ones queued behind a prefill.
+
+    /api/status counts every engine's requests (queued ones too) but not per
+    model; /activity is per model but misses queued requests. So: the status
+    total minus the other models' /activity counts.
+    """
+    total = in_flight(status)
+    if not total or not any(m != model_id for m in status.get("loaded_models") or []):
+        return total
+    activity = client.admin("GET", "/activity")
+    others = sum(model_load(m) for m in (activity.get("active_models") or {}).get("models") or []
+                 if m.get("id") != model_id)
+    return max(0, total - others)
+
+
+def cancel_orphan(client: OmlxClient, kind: str, bench_id: str | None, model_id: str,
+                  grace: float = ORPHAN_GRACE_SECONDS) -> None:
+    """Cancel a run we know nothing live about (no phase info), without
+    stranding a user request: wait until at most one request (the benchmark's
+    own) is on its model, or give up waiting after `grace` seconds."""
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        try:
+            if requests_on(client, model_id, client.status()) <= 1:
+                break
+        except NET_ERRORS:
+            pass
+        time.sleep(FAST_POLL_SECONDS)
+    client.cancel(kind, bench_id)
 
 
 @dataclass
 class TrafficWatch:
-    """Tracks when the server last showed signs of real use."""
+    """Tracks when the server last showed signs of real use (between runs)."""
 
     last_total: int | None = None
     last_activity: float = field(default_factory=time.monotonic)
 
-    def observe_idle(self, status: dict) -> None:
+    def observe(self, status: dict) -> None:
         total = status.get("total_requests")
-        busy = (status.get("active_requests") or 0) + (status.get("waiting_requests") or 0)
-        if total != self.last_total or busy or status.get("models_loading"):
-            self.last_activity = time.monotonic()
+        if total != self.last_total or in_flight(status) or status.get("models_loading"):
+            self.touch()
         self.last_total = total
+
+    def touch(self) -> None:
+        self.last_activity = time.monotonic()
 
     def quiet_for(self) -> float:
         return time.monotonic() - self.last_activity
@@ -134,6 +162,7 @@ class Runner:
         self.load_targets = targets_loader
         self.quiet_minutes_override = quiet_minutes
         self.traffic = TrafficWatch()
+        self.imports = ImportState()
         self._last_gate_msg: str | None = None
         self._last_import = float("-inf")
 
@@ -162,12 +191,12 @@ class Runner:
                     continue
                 self.maybe_snapshot_usage()
                 try:
-                    env, models = self.capture()
+                    state = capture_state(self.client, self.db)
                 except NET_ERRORS as e:
                     self._say(f"server unreachable: {e}")
                     time.sleep(IDLE_SLEEP_SECONDS)
                     continue
-                units = plan(self.db, targets, models, env.hash)
+                units = plan(self.db, targets, state.models, state.env.hash)
                 if not units:
                     self._say("nothing to do: every target has a result")
                     if once:
@@ -175,7 +204,7 @@ class Runner:
                     time.sleep(NOTHING_TO_DO_SLEEP_SECONDS)
                     continue
                 self._last_gate_msg = None
-                self.execute(units[0], env)
+                self.execute(units[0], state)
                 if once:
                     return
         except (KeyboardInterrupt, _Shutdown):
@@ -197,22 +226,22 @@ class Runner:
         if paused:
             return False, desc or "paused"
         try:
+            self.traffic.observe(self.client.status())
+            quiet = self.traffic.quiet_for()
+            if quiet < quiet_minutes * 60:
+                left = quiet_minutes * 60 - quiet
+                return False, f"waiting for {quiet_minutes:g} quiet minutes (~{left / 60:.0f} min to go)"
+            # Only worth asking once we'd otherwise start.
             health = self.client.health()
             if health.get("http_status") != 200 or health.get("status") != "healthy":
                 return False, f"server not ready: {health.get('status')}"
-            status = self.client.status()
             busy = self.other_bench_running()
         except NET_ERRORS as e:
-            self.traffic.last_activity = time.monotonic()
+            self.traffic.touch()
             return False, f"server unreachable: {e}"
-        self.traffic.observe_idle(status)
         if busy:
-            self.traffic.last_activity = time.monotonic()
+            self.traffic.touch()
             return False, f"another benchmark is running ({busy})"
-        quiet = self.traffic.quiet_for()
-        if quiet < quiet_minutes * 60:
-            left = quiet_minutes * 60 - quiet
-            return False, f"waiting for {quiet_minutes:g} quiet minutes (~{left / 60:.0f} min to go)"
         return True, "ok"
 
     def other_bench_running(self) -> str | None:
@@ -225,22 +254,13 @@ class Runner:
             return "intelligence"
         return None
 
-    def capture(self) -> tuple[Environment, list[ModelSnapshot]]:
-        env = capture_environment(self.client)
-        self.env_id = self.db.upsert_environment(env)
-        models = [snapshot_model(e) for e in self.client.admin_models()]
-        self.snapshot_ids = {m.model_id: self.db.upsert_model_snapshot(m) for m in models}
-        return env, models
-
     def maybe_import_ui(self) -> None:
         """Keep results of runs started from the web UI (oMLX forgets them)."""
         if time.monotonic() - self._last_import < IMPORT_INTERVAL_SECONDS:
             return
         self._last_import = time.monotonic()
-        from .importer import import_ui
-
         try:
-            import_ui(self.client, self.db)
+            import_ui(self.client, self.db, state=self.imports)
         except _Shutdown:
             raise
         except Exception as e:  # noqa: BLE001 - a failed import must not stop the runner
@@ -266,65 +286,78 @@ class Runner:
         for run in self.db.q("SELECT * FROM runs WHERE status = 'running' AND source = 'runner'"):
             server_status = None
             try:
-                if run["kind"] == "perf" and run["omlx_bench_id"]:
-                    server_status = self.client.perf_results(run["omlx_bench_id"]).get("status")
-                elif run["kind"] == "context" and run["omlx_bench_id"]:
-                    server_status = self.client.context_results(run["omlx_bench_id"]).get("status")
-                elif run["kind"] == "accuracy":
-                    acc = self.client.accuracy_status()
-                    if acc.get("current_bench_id") == run["omlx_bench_id"] and acc.get("running"):
-                        server_status = "running"
+                result = self.client.results(run["kind"], run["omlx_bench_id"])
+                if run["kind"] == "accuracy":
+                    ours = result.get("current_bench_id") == run["omlx_bench_id"]
+                    server_status = "running" if ours and result.get("running") else None
+                else:
+                    server_status = result.get("status")
+                if server_status == "running":
+                    log.info("cancelling orphaned run %s (%s)", run["id"], run["omlx_bench_id"])
+                    cancel_orphan(self.client, run["kind"], run["omlx_bench_id"], run["model_id"])
             except NET_ERRORS:
                 pass
-            if server_status == "running":
-                log.info("cancelling orphaned run %s (%s)", run["id"], run["omlx_bench_id"])
-                cancel_bench(self.client, run["kind"], run["omlx_bench_id"])
             self.db.finish_run(run["id"], status="interrupted",
                                error=f"runner exited mid-run (server status: {server_status})")
 
     # -- one run ----------------------------------------------------------
 
-    def execute(self, unit: WorkUnit, env: Environment) -> str:
+    def execute(self, unit: WorkUnit, state: State) -> None:
         log.info("starting %s", unit.describe())
         request = unit.request()
         run_id = self.db.create_run(
             kind=unit.kind, model_id=unit.model.model_id,
-            model_snapshot_id=self.snapshot_ids.get(unit.model.model_id),
-            environment_id=self.env_id, request=request, spec_keys=[s.key for s in unit.specs],
+            model_snapshot_id=state.snapshot_ids.get(unit.model.model_id),
+            environment_id=state.env_id, request=request, spec_keys=[s.key for s in unit.specs],
         )
-        exec_ = _Execution(self, unit, env, run_id, request)
+        exec_ = _Execution(self.client, self.db, unit, state.env.hash, run_id, request)
         try:
-            return exec_.run()
+            exec_.run()
+            if exec_.cancel_reason == "user_traffic":
+                self.traffic.touch()  # restart the quiet period from now
         except (KeyboardInterrupt, _Shutdown):
-            exec_.abort("shutdown")
+            exec_.cancel_when_clear("shutdown", grace=SHUTDOWN_GRACE_SECONDS)
             exec_.restore_context_setting()
             self.db.finish_run(run_id, status="cancelled", cancel_reason="shutdown")
             raise
 
 
+@dataclass
+class _Observation:
+    paused: bool
+    completed: int  # API requests completed since the run started
+    foreign: bool   # another model loaded/loading while the benchmark should be alone
+    guests: int     # user requests in flight on the benchmark's model
+
+
 class _Execution:
-    def __init__(self, runner: Runner, unit: WorkUnit, env: Environment, run_id: int, request: dict):
-        self.r = runner
-        self.client = runner.client
-        self.db = runner.db
+    """One oMLX benchmark run: start, follow its events, yield, record."""
+
+    def __init__(self, client: OmlxClient, db: DB, unit: WorkUnit, env_hash: str,
+                 run_id: int, request: dict):
+        self.client = client
+        self.db = db
         self.unit = unit
-        self.env = env
+        self.env_hash = env_hash
         self.run_id = run_id
         self.request = request
         self.bench_id: str | None = None
-        self.cancel_reason: str | None = None
-        self.yield_pending: str | None = None
-        self.guests_seen = 0
-        self.last_guest_seen = 0.0
-        self.surplus_streak = 0
-        self.phantom_cleared = False
-        self.current_batch: int | None = None
+        self.baseline = 0
         self.phase: str | None = None
+        self.current_batch = 0
         self.terminal: dict | None = None
         self.recorded: set[str] = set()
         self.upload_events: list[dict] = []
         self.prior_max_context: object = _UNSET
         self.pending_context: tuple[Spec, dict] | None = None
+        # Yield state machine: running -> waiting (for a user request on our
+        # model to finish) -> cancelling. See step().
+        self.state = "running"
+        self.cancel_reason: str | None = None
+        self.surplus_since: float | None = None
+        self.wait_reason: str | None = None
+        self.wait_target = 0
+        self.last_guest = 0.0
 
     # -- start ------------------------------------------------------------
 
@@ -344,23 +377,22 @@ class _Execution:
             self.bench_id = self.client.start_context(self.request)["bench_id"]
         self.db.set_bench_id(self.run_id, self.bench_id)
 
-    def run(self) -> str:
+    def run(self) -> None:
         try:
+            self.baseline = self.client.status().get("total_requests") or 0
             self.start()
         except NET_ERRORS as e:
-            permanent = isinstance(e, OmlxError) and e.status in (400, 404, 422)
             self.db.finish_run(self.run_id, status="error", error=str(e))
-            if permanent:
+            if isinstance(e, OmlxError) and e.status in (400, 404, 422):
                 self.fail_unrecorded(str(e))
             log.warning("could not start run: %s", e)
-            return "error"
-        self.baseline = self.client.status().get("total_requests")
+            return
         log.info("oMLX bench id %s", self.bench_id)
         try:
             self.consume()
         finally:
             self.restore_context_setting()
-        return self.finish()
+        self.finish()
 
     # -- event loop ---------------------------------------------------------
 
@@ -368,10 +400,10 @@ class _Execution:
         pump = EventPump(self.client, self.client.stream_path(self.unit.kind, self.bench_id))
         seq = 0
         next_check = time.monotonic() + POLL_SECONDS
-        drain_deadline: float | None = None
+        drain_deadline = 0.0
         while True:
             try:
-                item = pump.queue.get(timeout=POLL_SECONDS)
+                item = pump.queue.get(timeout=max(0.05, next_check - time.monotonic()))
             except queue.Empty:
                 item = None
             if isinstance(item, tuple) and item[0] == EventPump.EOF:
@@ -380,45 +412,26 @@ class _Execution:
                 return
             if item is not None:
                 seq += 1
-                self.db.add_event(self.run_id, seq, item)
+                self.db.add_events(self.run_id, [(seq, item)])
                 self.handle(item)
-            if drain_deadline is not None:
+            if self.state == "cancelling":
                 if time.monotonic() > drain_deadline:
                     log.warning("gave up waiting for the cancelled run to wind down")
                     return
             elif time.monotonic() >= next_check:
-                next_check = time.monotonic() + POLL_SECONDS
-                reason = self.yield_pending or self.should_yield()
-                if not reason:
-                    continue
-                # Cancelling makes oMLX unload the benchmark's model with an
-                # immediate abort, which strands any user request on that
-                # same model (it hangs and never completes). So while the
-                # user is talking to the model under test, let the benchmark
-                # carry on and cancel only once their requests are done.
-                if self.user_requests_pending():
-                    if self.yield_pending is None:
-                        log.info("user request on %s; cancelling once it finishes",
-                                 self.unit.model.model_id)
-                    self.yield_pending = reason
-                    next_check = time.monotonic() + FAST_POLL_SECONDS
-                    continue
-                if self.phantom_cleared:
-                    # The surplus turned out to be transient; re-evaluate
-                    # from scratch on the next poll instead of cancelling.
-                    self.phantom_cleared = False
-                    continue
-                self.abort(reason)
-                drain_deadline = time.monotonic() + DRAIN_TIMEOUT_SECONDS
+                self.step()
+                if self.state == "cancelling":
+                    drain_deadline = time.monotonic() + DRAIN_TIMEOUT_SECONDS
+                fast = self.state == "waiting"
+                next_check = time.monotonic() + (FAST_POLL_SECONDS if fast else POLL_SECONDS)
 
     def handle(self, ev: dict) -> None:
         t = ev.get("type")
         if t == "progress":
             self.phase = ev.get("phase")
-            m = re.match(r"Batch (\d+)x", ev.get("message") or "")
-            if m:
+            msg = ev.get("message") or ""
+            if m := re.match(r"Batch (\d+)x", msg):  # oMLX reports the batch size only here
                 self.current_batch = int(m.group(1))
-            msg = ev.get("message")
             if msg:
                 log.info("  %s", msg)
         elif t == "result":
@@ -430,112 +443,110 @@ class _Execution:
             if t == "error":
                 log.warning("  oMLX reported error: %s", ev.get("message"))
 
-    def should_yield(self) -> str | None:
-        paused, _ = pause_state(self.db)
-        if paused:
-            return "paused"
+    # -- yielding -----------------------------------------------------------
+
+    def own_requests(self) -> int:
+        """Requests the benchmark itself has in flight right now."""
+        if self.phase == "batch":
+            return self.current_batch
+        if self.phase == "eval":
+            return self.request.get("batch_size", 1)
+        return _OWN_REQUESTS.get(self.phase, 0)
+
+    def observe(self) -> _Observation | None:
         try:
             status = self.client.status()
+            guests = requests_on(self.client, self.unit.model.model_id, status) - self.own_requests()
         except NET_ERRORS:
             return None
-        if status.get("total_requests") != self.baseline:
-            return "user_traffic"
-        if self.phase in _STEADY_PHASES:
-            ours = self.unit.model.model_id
-            others = [m for m in status.get("loaded_models") or [] if m != ours]
-            if others or status.get("models_loading"):
-                return "user_traffic"
-            in_flight = (status.get("active_requests") or 0) + (status.get("waiting_requests") or 0)
-            # Requests linger briefly when one batch test hands over to the
-            # next, so only a surplus seen on consecutive polls counts.
-            if in_flight > self.expected_in_flight():
-                self.surplus_streak += 1
-                if self.surplus_streak >= 2:
-                    return "user_traffic"
-            else:
-                self.surplus_streak = 0
-        return None
-
-    def expected_in_flight(self) -> int:
-        """How many requests the benchmark itself has in flight right now."""
-        if self.unit.kind == "perf":
-            if self.phase == "batch":
-                return self.current_batch or max([1, *self.request.get("batch_sizes", [])])
-            return 1
-        if self.unit.kind == "accuracy":
-            return self.request.get("batch_size", 1)
-        return 1
-
-    def user_requests_pending(self) -> bool:
-        """Is a user request in flight on the benchmark's model?
-
-        /api/status counts every request in every engine, including ones
-        queued behind the benchmark's prefill (/activity misses those), so
-        subtract other models' requests (from /activity) and the benchmark's
-        own. Between two tests the benchmark briefly has none in flight, so a
-        lone user request can look like the benchmark's: once a guest has been
-        seen, also wait until that many API requests have completed.
-        """
-        try:
-            status = self.client.status()
-            activity = self.client.admin("GET", "/activity")
-        except NET_ERRORS:
-            return True  # can't tell; cancelling blind could strand a request
-        ours = self.unit.model.model_id
-        others = sum(
-            (m.get("active_requests") or 0) + (m.get("waiting_requests") or 0)
-            for m in (activity.get("active_models") or {}).get("models") or []
-            if m.get("id") != ours
+        steady = self.own_requests() > 0
+        others = [m for m in status.get("loaded_models") or [] if m != self.unit.model.model_id]
+        return _Observation(
+            paused=pause_state(self.db)[0],
+            completed=(status.get("total_requests") or 0) - self.baseline,
+            foreign=steady and bool(others or status.get("models_loading")),
+            guests=guests,
         )
-        in_flight = (status.get("active_requests") or 0) + (status.get("waiting_requests") or 0)
-        guests = in_flight - others - self.expected_in_flight()
-        completed = (status.get("total_requests") or 0) - (self.baseline or 0)
-        if guests > 0:
-            self.guests_seen = max(self.guests_seen, completed + guests)
-            self.last_guest_seen = time.monotonic()
-            return True
-        if completed < self.guests_seen:
-            if time.monotonic() - self.last_guest_seen < PHANTOM_GUEST_SECONDS:
-                return True
-            # Nothing in flight for a while and nothing completed: the
-            # "guest" was a transient count, not a user request.
-            log.info("no user request after all; continuing")
-            self.guests_seen = completed
-            self.yield_pending = None
-            self.surplus_streak = 0
-            self.phantom_cleared = True
-        return False
 
-    def abort(self, reason: str) -> None:
-        if self.cancel_reason:
+    def step(self) -> None:
+        """One poll of the yield state machine.
+
+        running: yield on a pause, a completed API request, another model
+          being loaded, or a surplus request on our model that persists
+          (requests linger briefly at test boundaries). If a user request is
+          on our model, go to waiting instead of cancelling.
+        waiting: cancel once every user request seen has completed. If the
+          surplus vanishes without anything completing, it was noise: go
+          back to running and decide again.
+        """
+        o = self.observe()
+        if o is None:
             return
-        self.cancel_reason = reason
+        t = time.monotonic()
+        if self.state == "running":
+            if o.guests > 0:
+                self.surplus_since = self.surplus_since or t
+            else:
+                self.surplus_since = None
+            reason = ("paused" if o.paused else
+                      "user_traffic" if o.completed > 0 or o.foreign else
+                      "user_traffic" if self.surplus_since and t - self.surplus_since >= GUEST_DEBOUNCE_SECONDS
+                      else None)
+            if reason is None:
+                return
+            if o.guests > 0:
+                log.info("user request on %s; cancelling once it finishes", self.unit.model.model_id)
+                self.state, self.wait_reason = "waiting", reason
+                self.wait_target, self.last_guest = o.completed + o.guests, t
+            else:
+                self.cancel(reason)
+        elif self.state == "waiting":
+            if o.guests > 0:
+                self.wait_target = max(self.wait_target, o.completed + o.guests)
+                self.last_guest = t
+            elif o.completed >= self.wait_target:
+                self.cancel(self.wait_reason or "user_traffic")
+            elif t - self.last_guest > PHANTOM_GUEST_SECONDS:
+                log.info("no user request after all; continuing")
+                self.state, self.surplus_since = "running", None
+
+    def cancel(self, reason: str) -> None:
+        self.state, self.cancel_reason = "cancelling", reason
         log.info("yielding the server (%s): cancelling %s", reason, self.bench_id)
         try:
-            cancel_bench(self.client, self.unit.kind, self.bench_id)
+            self.client.cancel(self.unit.kind, self.bench_id)
         except NET_ERRORS as e:
             log.warning("cancel failed: %s", e)
+
+    def cancel_when_clear(self, reason: str, grace: float) -> None:
+        """Blocking cancel for shutdown: run the state machine (without
+        reading events) until it cancels, or cancel anyway after `grace`."""
+        if self.state == "cancelling" or self.bench_id is None:
+            return
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            o = self.observe()
+            if o is not None and o.guests <= 0 and (self.state != "waiting"
+                                                    or o.completed >= self.wait_target):
+                break
+            if o is not None and o.guests > 0:
+                self.state = "waiting"
+                self.wait_target = max(self.wait_target, o.completed + o.guests)
+            time.sleep(FAST_POLL_SECONDS)
+        self.cancel(reason)
 
     # -- recording ------------------------------------------------------------
 
     def spec_for(self, data: dict) -> Spec | None:
-        kind = self.unit.kind
-        if kind == "perf":
+        if self.unit.kind == "perf":
             p = self.unit.specs[0].p
-            common = dict(tg=self.request["generation_length"], context_profile=p["context_profile"],
-                          force_lm_engine=p["force_lm_engine"])
-            if data.get("test_type") == "single":
-                return perf_single(data.get("pp"), **common)
-            if data.get("test_type") == "batch":
-                return perf_batch(data.get("batch_size"), **common)
+            return perf_spec_from_result(data, tg=self.request["generation_length"],
+                                         context_profile=p["context_profile"],
+                                         force_lm_engine=p["force_lm_engine"])
+        spec = self.unit.specs[0]
+        if self.unit.kind == "accuracy" and data.get("benchmark") != spec.p["suite"]:
             return None
-        if kind == "accuracy":
-            p = self.unit.specs[0].p
-            if data.get("benchmark") != p["suite"]:
-                return None
-            return accuracy(p["suite"], p["sample_size"], p["enable_thinking"],
-                            p["sampling_profile"], p["batch_size"])
-        return self.unit.specs[0]
+        return spec
 
     def record(self, data: dict) -> None:
         spec = self.spec_for(data)
@@ -552,7 +563,8 @@ class _Execution:
                 log.info("  result batch%s: tg %s tok/s", data.get("batch_size"),
                          _fmt(data.get("tg_tps")))
         elif self.unit.kind == "accuracy":
-            self.db.insert_accuracy_result(self.run_id, spec.key, spec.p["sample_size"], data)
+            self.db.insert_accuracy_result(self.run_id, self.unit.model.model_id, spec.key,
+                                           spec.p["sample_size"], data)
             log.info("  result %s: %.1f%% (%s/%s)", data.get("benchmark"),
                      100 * (data.get("accuracy") or 0), data.get("correct"), data.get("total"))
         else:
@@ -596,19 +608,14 @@ class _Execution:
                 self.db.mark_spec(self.unit.model.model_id, spec.key,
                                   self.unit.model.settings_fingerprint, ok=False,
                                   run_id=self.run_id, error=error,
-                                  environment_hash=self.env.hash)
+                                  environment_hash=self.env_hash)
 
     # -- finish -------------------------------------------------------------
 
-    def finish(self) -> str:
+    def finish(self) -> None:
         final = None
         try:
-            if self.unit.kind == "perf":
-                final = self.client.perf_results(self.bench_id)
-            elif self.unit.kind == "context":
-                final = self.client.context_results(self.bench_id)
-            else:
-                final = self.client.accuracy_status()
+            final = self.client.results(self.unit.kind, self.bench_id)
         except NET_ERRORS as e:
             log.warning("could not fetch final results: %s", e)
 
@@ -640,7 +647,6 @@ class _Execution:
         log.info("run %s %s%s (%d/%d results)", self.run_id, status,
                  f" ({self.cancel_reason})" if self.cancel_reason else "",
                  len(self.recorded), len(self.unit.specs))
-        return status
 
 
 _UNSET = object()

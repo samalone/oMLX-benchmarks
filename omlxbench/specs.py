@@ -30,8 +30,6 @@ ACCURACY_SUITES = {
 ACCURACY_BATCH_SIZES = {1, 2, 4, 8, 16, 32}
 CONTEXT_TARGETS = {16384, 32768, 65536, 131072, 262144, 524288}
 
-RUN_KINDS = ("perf", "accuracy", "context")
-
 
 @dataclass(frozen=True)
 class Spec:
@@ -80,6 +78,16 @@ def perf_batch(batch_size: int, tg: int = 128, context_profile: str = "code_pyth
                      context_profile=context_profile, force_lm_engine=force_lm_engine)
 
 
+def perf_spec_from_result(r: dict, *, tg: int, context_profile: str,
+                          force_lm_engine: bool = False) -> Spec | None:
+    """The spec an oMLX perf `result` row satisfies."""
+    if r.get("test_type") == "single":
+        return perf_single(r.get("pp"), tg, context_profile, force_lm_engine)
+    if r.get("test_type") == "batch":
+        return perf_batch(r.get("batch_size"), tg, context_profile, force_lm_engine)
+    return None
+
+
 def accuracy(suite: str, sample_size: int, enable_thinking: bool = False,
              sampling_profile: str = "deterministic", batch_size: int = 1) -> Spec:
     return Spec.make("accuracy", suite=suite, sample_size=sample_size,
@@ -114,6 +122,7 @@ class Targets:
     quiet_minutes: float = 10.0
 
     def wants_model(self, entry: dict) -> bool:
+        """`entry` is an /admin/api/models entry (or ModelSnapshot.admin_model)."""
         return (
             (entry.get("model_type") or "llm") in self.model_types
             and not entry.get("is_helper")

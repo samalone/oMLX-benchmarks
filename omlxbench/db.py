@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .snapshot import Environment, ModelSnapshot
+from .snapshot import Environment, ModelSnapshot, accuracy_identity, canonical
 
 
 def now() -> str:
@@ -22,7 +22,7 @@ def now() -> str:
 
 
 def dumps(obj: Any) -> str | None:
-    return None if obj is None else json.dumps(obj, sort_keys=True, default=str)
+    return None if obj is None else canonical(obj)
 
 
 _SCHEMA_V1 = """
@@ -249,8 +249,13 @@ LEFT JOIN environments e ON e.id = r.environment_id;
 """
 
 
+_SCHEMA_V2 = """
+ALTER TABLE accuracy_results ADD COLUMN identity TEXT;
+CREATE INDEX accuracy_results_identity ON accuracy_results(identity);
+"""
+
 # Each entry upgrades the schema by one version. Append; never edit old ones.
-MIGRATIONS: list[str] = [_SCHEMA_V1]
+MIGRATIONS: list[str] = [_SCHEMA_V1, _SCHEMA_V2]
 
 
 class DB:
@@ -259,6 +264,7 @@ class DB:
         self.conn = sqlite3.connect(path, timeout=30, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")  # safe with WAL; no fsync per commit
         self.conn.execute("PRAGMA foreign_keys=ON")
         self._migrate()
 
@@ -347,12 +353,17 @@ class DB:
                        run_id, key)
         return run_id
 
+    def run_exists(self, omlx_bench_id: str) -> bool:
+        return self.q1("SELECT 1 FROM runs WHERE omlx_bench_id = ?", omlx_bench_id) is not None
+
     def set_bench_id(self, run_id: int, bench_id: str) -> None:
         self.x("UPDATE runs SET omlx_bench_id = ? WHERE id = ?", bench_id, run_id)
 
-    def add_event(self, run_id: int, seq: int, event: dict) -> None:
-        self.x("INSERT OR IGNORE INTO run_events(run_id, seq, ts, type, json) VALUES (?,?,?,?,?)",
-               run_id, seq, now(), event.get("type"), dumps(event))
+    def add_events(self, run_id: int, events: list[tuple[int, dict]]) -> None:
+        ts = now()
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO run_events(run_id, seq, ts, type, json) VALUES (?,?,?,?,?)",
+            [(run_id, seq, ts, ev.get("type"), dumps(ev)) for seq, ev in events])
 
     def finish_run(self, run_id: int, *, status: str, cancel_reason: str | None = None,
                    error: str | None = None, final: dict | None = None,
@@ -386,8 +397,8 @@ class DB:
             r.get("cached_tokens"), dumps(r), now(),
         )
 
-    def insert_accuracy_result(self, run_id: int, spec_key: str, sample_size: int,
-                               r: dict) -> int:
+    def insert_accuracy_result(self, run_id: int, model_id: str, spec_key: str,
+                               sample_size: int, r: dict) -> int:
         questions = r.get("question_results") or []
         summary = {k: v for k, v in r.items() if k != "question_results"}
         with self.tx():
@@ -395,12 +406,13 @@ class DB:
                 "INSERT INTO accuracy_results(run_id, spec_key, suite, sample_size, accuracy,"
                 " correct, total, dataset_total, time_s, thinking_used, sampling_profile,"
                 " finished_accuracy, truncated_count, category_scores_json, raw_json,"
-                " recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " recorded_at, identity) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 run_id, spec_key, r.get("benchmark"), sample_size, r.get("accuracy"),
                 r.get("correct"), r.get("total"), r.get("dataset_total"), r.get("time_s"),
                 int(bool(r.get("thinking_used"))), r.get("sampling_profile"),
                 r.get("finished_accuracy"), r.get("truncated_count"),
                 dumps(r.get("category_scores")), dumps(summary), now(),
+                accuracy_identity(model_id, r),
             )
             self.conn.executemany(
                 "INSERT INTO accuracy_questions(accuracy_result_id, qid, category, correct,"

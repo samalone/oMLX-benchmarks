@@ -69,36 +69,34 @@ def spec_state(db: DB, model_id: str, spec: Spec, fingerprint: str, env_hash: st
     return "missing"
 
 
-def plan(db: DB, targets: Targets, models: list[ModelSnapshot], env_hash: str) -> list[WorkUnit]:
-    wanted = [m for m in models if targets.wants_model(
-        {"id": m.model_id, "model_type": m.model_type, "is_helper": m.admin_model.get("is_helper")}
-    )]
-    # Smallest model first within a tier: fastest to fill in, so a comparable
-    # baseline across all models exists as early as possible.
-    wanted.sort(key=lambda m: (m.size_bytes or 0, m.model_id))
-
-    # tier -> model -> specs, de-duplicated across groups
-    by_tier: dict[int, dict[str, list[Spec]]] = defaultdict(lambda: defaultdict(list))
+def iter_targets(targets: Targets, models: list[ModelSnapshot]):
+    """Yield (tier, model, spec) for every wanted test, lowest tier first,
+    smallest model first within a tier, each (model, spec) once."""
+    wanted = sorted((m for m in models if targets.wants_model(m.admin_model)),
+                    key=lambda m: (m.size_bytes or 0, m.model_id))
     seen: set[tuple[str, str]] = set()
     for group in sorted(targets.groups, key=lambda g: g.tier):
         for m in wanted:
             if not group.applies_to(m.model_id):
                 continue
             for spec in group.specs:
-                if (m.model_id, spec.key) in seen:
-                    continue
-                seen.add((m.model_id, spec.key))
-                if spec_state(db, m.model_id, spec, m.settings_fingerprint, env_hash) == "missing":
-                    by_tier[group.tier][m.model_id].append(spec)
+                if (m.model_id, spec.key) not in seen:
+                    seen.add((m.model_id, spec.key))
+                    yield group.tier, m, spec
 
+
+def plan(db: DB, targets: Targets, models: list[ModelSnapshot], env_hash: str) -> list[WorkUnit]:
+    # Smallest model first within a tier: fastest to fill in, so a comparable
+    # baseline across all models exists as early as possible.
+    missing: dict[tuple[int, str], list[Spec]] = defaultdict(list)
+    by_id: dict[str, ModelSnapshot] = {}
+    for tier, m, spec in iter_targets(targets, models):
+        if spec_state(db, m.model_id, spec, m.settings_fingerprint, env_hash) == "missing":
+            missing[(tier, m.model_id)].append(spec)
+            by_id[m.model_id] = m
     units: list[WorkUnit] = []
-    model_by_id = {m.model_id: m for m in wanted}
-    for tier in sorted(by_tier):
-        for m in wanted:
-            specs = by_tier[tier].get(m.model_id)
-            if not specs:
-                continue
-            units.extend(_group(tier, model_by_id[m.model_id], specs))
+    for (tier, model_id), specs in missing.items():  # insertion order = tier, then size
+        units.extend(_group(tier, by_id[model_id], specs))
     return units
 
 

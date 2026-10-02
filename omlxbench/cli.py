@@ -10,15 +10,13 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 
-from .client import OmlxClient, OmlxError
+from .client import NET_ERRORS, OmlxClient
 from .config import load_config
 from .db import DB
-from .planner import plan, spec_state
-from .runner import (Runner, cancel_bench, clear_pause, daemon_alive, pause_state, set_pause)
+from .planner import iter_targets, plan, spec_state
+from .runner import Runner, cancel_orphan, clear_pause, daemon_alive, pause_state, set_pause
 from .snapshot import capture_environment, snapshot_model
 from .specs import load_targets
-
-log = logging.getLogger("omlxbench")
 
 
 def _parse_duration(text: str) -> timedelta:
@@ -55,7 +53,7 @@ class App:
             st = self.client.status()
             print(f"server:  oMLX {st.get('version')}, {st.get('models_discovered')} models, "
                   f"loaded: {', '.join(st.get('loaded_models') or []) or 'none'}")
-        except (OmlxError, OSError) as e:
+        except NET_ERRORS as e:
             print(f"server:  unreachable ({e})")
             st = None
         pid = daemon_alive(self.db)
@@ -95,14 +93,9 @@ class App:
         if args.failed:
             targets = self.targets()
             print("\nfailed (skipped until environment or settings change):")
-            for m in models:
-                for g in targets.groups:
-                    if not (g.applies_to(m.model_id) and targets.wants_model(
-                            {"id": m.model_id, "model_type": m.model_type})):
-                        continue
-                    for s in g.specs:
-                        if spec_state(self.db, m.model_id, s, m.settings_fingerprint, env.hash) == "failed":
-                            print(f"  {m.model_id}: {s.label()}")
+            for _, m, s in iter_targets(targets, models):
+                if spec_state(self.db, m.model_id, s, m.settings_fingerprint, env.hash) == "failed":
+                    print(f"  {m.model_id}: {s.label()}")
 
     def cmd_run(self, args) -> None:
         if args.dry_run:
@@ -123,9 +116,9 @@ class App:
         running = self.db.q("SELECT * FROM runs WHERE status='running' AND source='runner'")
         for run in running:
             try:
-                cancel_bench(self.client, run["kind"], run["omlx_bench_id"])
+                cancel_orphan(self.client, run["kind"], run["omlx_bench_id"], run["model_id"])
                 print(f"cancelled run {run['id']} ({run['kind']} on {run['model_id']})")
-            except (OmlxError, OSError) as e:
+            except NET_ERRORS as e:
                 print(f"could not cancel run {run['id']}: {e}", file=sys.stderr)
             self.db.finish_run(run["id"], status="cancelled", cancel_reason="paused")
 
@@ -135,10 +128,10 @@ class App:
                                                              "start one with `omlxbench run`)"))
 
     def cmd_report(self, args) -> None:
-        from .report import as_json, digest, markdown
+        from .report import digest, markdown
 
         d = digest(self.db)
-        print(as_json(d) if args.json else markdown(d))
+        print(json.dumps(d, indent=2) if args.json else markdown(d))
 
     def cmd_import_ui(self, args) -> None:
         from .importer import import_ui
@@ -178,7 +171,7 @@ class App:
         targets = self.targets()
         for e in self.client.admin_models():
             m = snapshot_model(e)
-            wanted = "*" if targets.wants_model(e) else " "
+            wanted = "*" if targets.wants_model(m.admin_model) else " "
             bits = f"{m.quant_bits:g}bit" if m.quant_bits else "?bit"
             print(f" {wanted} {m.model_id:<70} {m.model_type or '?':<4} {m.arch or '?':<14} "
                   f"{bits:<6} {(m.size_bytes or 0) / 1e9:5.1f} GB  [{m.settings_fingerprint}]")
@@ -230,5 +223,5 @@ def main(argv: list[str] | None = None) -> None:
     app = App()
     try:
         getattr(app, "cmd_" + args.cmd.replace("-", "_"))(args)
-    except OmlxError as e:
+    except NET_ERRORS as e:
         raise SystemExit(f"oMLX error: {e}")

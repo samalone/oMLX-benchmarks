@@ -7,6 +7,7 @@ track of, e.g., an oMLX upgrade or a model whose settings were changed.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import platform
@@ -14,15 +15,25 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .client import OmlxClient
+
+if TYPE_CHECKING:
+    from .db import DB
 
 _SECRET_MARKERS = ("api_key", "token", "password", "secret", "proxy", "sub_keys")
 
 
 def canonical(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def accuracy_identity(model_id: str, r: dict) -> str:
+    """Identity of one oMLX accuracy result, used to avoid recording it twice
+    (the runner records it live; oMLX's accumulated list repeats it)."""
+    return digest([model_id, r.get("benchmark"), r.get("total"), r.get("correct"),
+                   r.get("time_s")])
 
 
 def digest(obj: Any) -> str:
@@ -42,6 +53,7 @@ def scrub(obj: Any) -> Any:
     return obj
 
 
+@functools.cache
 def macos_version() -> str:
     try:
         return subprocess.run(
@@ -226,3 +238,22 @@ def snapshot_model(entry: dict) -> ModelSnapshot:
         config=config,
         admin_model={k: v for k, v in entry.items() if k not in volatile and k != "settings"},
     )
+
+
+@dataclass
+class State:
+    """Environment and model snapshots as recorded in the database."""
+
+    env: Environment
+    env_id: int
+    models: list[ModelSnapshot]
+    snapshot_ids: dict[str, int]
+
+
+def capture_state(client: OmlxClient, db: "DB") -> State:
+    env = capture_environment(client)
+    models = [snapshot_model(e) for e in client.admin_models()]
+    with db.tx():
+        env_id = db.upsert_environment(env)
+        snapshot_ids = {m.model_id: db.upsert_model_snapshot(m) for m in models}
+    return State(env, env_id, models, snapshot_ids)

@@ -20,7 +20,6 @@ class OmlxError(RuntimeError):
     def __init__(self, status: int, detail: str, path: str):
         super().__init__(f"{path}: HTTP {status}: {detail}")
         self.status = status
-        self.detail = detail
 
 
 def _detail(resp: httpx.Response) -> str:
@@ -145,6 +144,27 @@ class OmlxClient:
     def cancel_context(self, bench_id: str) -> Any:
         return self.admin("POST", f"/bench/context/{bench_id}/cancel")
 
+    def results(self, kind: str, bench_id: str | None) -> dict:
+        """Final/current state of a run. Accuracy has no per-run endpoint."""
+        if kind == "perf":
+            return self.perf_results(bench_id)
+        if kind == "context":
+            return self.context_results(bench_id)
+        return self.accuracy_status()
+
+    def cancel(self, kind: str, bench_id: str | None) -> None:
+        """Cancel a run; a run that already ended (HTTP 400) is fine."""
+        try:
+            if kind == "perf":
+                self.cancel_perf(bench_id)
+            elif kind == "context":
+                self.cancel_context(bench_id)
+            else:
+                self.cancel_accuracy()
+        except OmlxError as e:
+            if e.status != 400:
+                raise
+
     @staticmethod
     def stream_path(kind: str, bench_id: str) -> str:
         return {
@@ -170,6 +190,22 @@ class OmlxClient:
                 for line in resp.iter_lines():
                     if line.startswith("data:"):
                         yield json.loads(line[5:].strip())
+
+
+def in_flight(status: dict) -> int:
+    """Requests in flight according to /api/status.
+
+    `active_requests` counts every request with an output collector, which
+    includes ones still queued; `waiting_requests` counts the queued ones a
+    second time, so it must not be added.
+    """
+    return status.get("active_requests") or 0
+
+
+def model_load(activity_entry: dict) -> int:
+    """Requests on one model according to /admin/api/activity, which splits
+    them into running (`active_requests`) and queued (`waiting_requests`)."""
+    return (activity_entry.get("active_requests") or 0) + (activity_entry.get("waiting_requests") or 0)
 
 
 class EventPump:
