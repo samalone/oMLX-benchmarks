@@ -235,7 +235,9 @@ class Runner:
 
         try:
             import_ui(self.client, self.db)
-        except (OmlxError, OSError) as e:
+        except _Shutdown:
+            raise
+        except Exception as e:  # noqa: BLE001 - a failed import must not stop the runner
             log.warning("import of web-UI results failed: %s", e)
 
     def maybe_snapshot_usage(self) -> None:
@@ -488,6 +490,7 @@ class _Execution:
             log.info("no user request after all; continuing")
             self.guests_seen = completed
             self.yield_pending = None
+            self.surplus_streak = 0
             self.phantom_cleared = True
         return False
 
@@ -568,8 +571,10 @@ class _Execution:
                          self.prior_max_context, now_value)
         except (OmlxError, OSError) as e:
             log.warning("could not restore max_context_window: %s", e)
+        self.prior_max_context = _UNSET  # restore at most once (also called on shutdown)
         if self.pending_context:
             spec, data = self.pending_context
+            self.pending_context = None
             self.db.insert_context_result(self.run_id, spec.key, data, restored)
             self.mark_ok(spec)
 
