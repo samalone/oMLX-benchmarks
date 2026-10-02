@@ -33,6 +33,12 @@ def _detail(resp: httpx.Response) -> str:
     return json.dumps(body)[:500]
 
 
+# Everything a call to the server can raise that means "no usable answer
+# right now". httpx transport errors are not OSError subclasses, and
+# ValueError covers a non-JSON body.
+NET_ERRORS = (OmlxError, OSError, httpx.HTTPError, ValueError)
+
+
 class OmlxClient:
     def __init__(self, base_url: str, api_key: str, timeout: float = 60.0):
         self.base_url = base_url

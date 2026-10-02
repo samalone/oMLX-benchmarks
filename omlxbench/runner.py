@@ -18,12 +18,13 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import re
 import signal
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from .client import EventPump, OmlxClient, OmlxError
+from .client import NET_ERRORS, EventPump, OmlxClient, OmlxError
 from .db import DB, dumps, now
 from .planner import WorkUnit, plan
 from .snapshot import Environment, ModelSnapshot, capture_environment, snapshot_model
@@ -160,7 +161,12 @@ class Runner:
                     time.sleep(IDLE_SLEEP_SECONDS)
                     continue
                 self.maybe_snapshot_usage()
-                env, models = self.capture()
+                try:
+                    env, models = self.capture()
+                except NET_ERRORS as e:
+                    self._say(f"server unreachable: {e}")
+                    time.sleep(IDLE_SLEEP_SECONDS)
+                    continue
                 units = plan(self.db, targets, models, env.hash)
                 if not units:
                     self._say("nothing to do: every target has a result")
@@ -196,7 +202,7 @@ class Runner:
                 return False, f"server not ready: {health.get('status')}"
             status = self.client.status()
             busy = self.other_bench_running()
-        except (OmlxError, OSError) as e:
+        except NET_ERRORS as e:
             self.traffic.last_activity = time.monotonic()
             return False, f"server unreachable: {e}"
         self.traffic.observe_idle(status)
@@ -247,7 +253,7 @@ class Runner:
             return
         try:
             usage = self.client.usage("30d")
-        except OmlxError as e:
+        except NET_ERRORS as e:
             log.warning("usage snapshot failed: %s", e)
             return
         self.db.x("INSERT INTO usage_snapshots(captured_at, range, json) VALUES (?,?,?)",
@@ -268,7 +274,7 @@ class Runner:
                     acc = self.client.accuracy_status()
                     if acc.get("current_bench_id") == run["omlx_bench_id"] and acc.get("running"):
                         server_status = "running"
-            except OmlxError:
+            except NET_ERRORS:
                 pass
             if server_status == "running":
                 log.info("cancelling orphaned run %s (%s)", run["id"], run["omlx_bench_id"])
@@ -312,6 +318,7 @@ class _Execution:
         self.last_guest_seen = 0.0
         self.surplus_streak = 0
         self.phantom_cleared = False
+        self.current_batch: int | None = None
         self.phase: str | None = None
         self.terminal: dict | None = None
         self.recorded: set[str] = set()
@@ -328,7 +335,9 @@ class _Execution:
         elif kind == "accuracy":
             status = self.client.add_accuracy(self.request)
             if status.get("current_model") != self.unit.model.model_id:
-                raise RuntimeError(f"accuracy queue did not start our run: {status}")
+                # Someone else's job got there first; treat it like a busy server.
+                raise OmlxError(409, f"accuracy queue did not start our run: {status}",
+                                "/admin/api/bench/accuracy/queue/add")
             self.bench_id = status["current_bench_id"]
         else:
             self.prior_max_context = self.unit.model.settings.get("max_context_window")
@@ -338,8 +347,8 @@ class _Execution:
     def run(self) -> str:
         try:
             self.start()
-        except OmlxError as e:
-            permanent = e.status in (400, 404, 422)
+        except NET_ERRORS as e:
+            permanent = isinstance(e, OmlxError) and e.status in (400, 404, 422)
             self.db.finish_run(self.run_id, status="error", error=str(e))
             if permanent:
                 self.fail_unrecorded(str(e))
@@ -406,6 +415,9 @@ class _Execution:
         t = ev.get("type")
         if t == "progress":
             self.phase = ev.get("phase")
+            m = re.match(r"Batch (\d+)x", ev.get("message") or "")
+            if m:
+                self.current_batch = int(m.group(1))
             msg = ev.get("message")
             if msg:
                 log.info("  %s", msg)
@@ -424,7 +436,7 @@ class _Execution:
             return "paused"
         try:
             status = self.client.status()
-        except (OmlxError, OSError):
+        except NET_ERRORS:
             return None
         if status.get("total_requests") != self.baseline:
             return "user_traffic"
@@ -448,7 +460,7 @@ class _Execution:
         """How many requests the benchmark itself has in flight right now."""
         if self.unit.kind == "perf":
             if self.phase == "batch":
-                return max([1, *self.request.get("batch_sizes", [])])
+                return self.current_batch or max([1, *self.request.get("batch_sizes", [])])
             return 1
         if self.unit.kind == "accuracy":
             return self.request.get("batch_size", 1)
@@ -467,7 +479,7 @@ class _Execution:
         try:
             status = self.client.status()
             activity = self.client.admin("GET", "/activity")
-        except (OmlxError, OSError):
+        except NET_ERRORS:
             return True  # can't tell; cancelling blind could strand a request
         ours = self.unit.model.model_id
         others = sum(
@@ -501,7 +513,7 @@ class _Execution:
         log.info("yielding the server (%s): cancelling %s", reason, self.bench_id)
         try:
             cancel_bench(self.client, self.unit.kind, self.bench_id)
-        except (OmlxError, OSError) as e:
+        except NET_ERRORS as e:
             log.warning("cancel failed: %s", e)
 
     # -- recording ------------------------------------------------------------
@@ -569,7 +581,7 @@ class _Execution:
                 restored = self.prior_max_context
                 log.info("  restored max_context_window to %s (benchmark had set %s)",
                          self.prior_max_context, now_value)
-        except (OmlxError, OSError) as e:
+        except NET_ERRORS as e:
             log.warning("could not restore max_context_window: %s", e)
         self.prior_max_context = _UNSET  # restore at most once (also called on shutdown)
         if self.pending_context:
@@ -597,7 +609,7 @@ class _Execution:
                 final = self.client.context_results(self.bench_id)
             else:
                 final = self.client.accuracy_status()
-        except (OmlxError, OSError) as e:
+        except NET_ERRORS as e:
             log.warning("could not fetch final results: %s", e)
 
         server_status = (final or {}).get("status") or (final or {}).get("phase")
