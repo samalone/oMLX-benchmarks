@@ -25,10 +25,13 @@ tier = 1
 perf = { prompt_lengths = [1024, 4096], batch_sizes = [2, 4], context_profile = "code_python" }
 
 # Tier 2: speed and memory at Hermes-sized contexts, and the largest prompt
-# that actually fits in memory.
+# that actually fits in memory. agent_turns replays a Hermes-shaped session
+# (20k-token start, then ~4k new tokens per step up to ~64k, prefix-cached)
+# and times every step: the closest number to how Hermes feels.
 [[benchmarks]]
 tier = 2
 perf = { prompt_lengths = [16384, 32768, 65536] }
+agent_turns = { enable_thinking = true }
 context = { target_tokens = 131072 }
 # Devstral ran at 15 tok/s at 4k context in tier 1: far too slow for an agent.
 exclude_models = ["Devstral-*"]

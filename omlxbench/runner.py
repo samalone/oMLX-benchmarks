@@ -257,10 +257,11 @@ class Runner:
             model_snapshot_id=state.snapshot_ids.get(unit.model.model_id),
             environment_id=state.env_id, request=request, spec_keys=[s.key for s in unit.specs],
         )
-        if unit.kind == "tools":
-            from .harness import ToolsExecution
+        if unit.kind in ("tools", "agent_turns"):
+            from .harness import AgentTurnsExecution, ToolsExecution
 
-            harness = ToolsExecution(self.client, self.db, unit, state.env.hash, run_id)
+            cls = ToolsExecution if unit.kind == "tools" else AgentTurnsExecution
+            harness = cls(self.client, self.db, unit, state.env.hash, run_id)
             try:
                 harness.run()  # closing our connection on the way out cancels cleanly
             except (KeyboardInterrupt, _Shutdown):

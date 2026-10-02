@@ -1,4 +1,5 @@
-"""Suites omlxbench runs itself through oMLX's chat API (not oMLX built-ins).
+"""Suites omlxbench runs itself through oMLX's chat API (not oMLX built-ins):
+BFCL tool calling and the Hermes-shaped agent-turns replay.
 
 Unlike the built-in benchmarks, these own their requests, so yielding is
 clean: dropping our connection makes oMLX abort just our request, and the
@@ -39,8 +40,8 @@ class _Aborted(Exception):
     pass
 
 
-class ToolsExecution:
-    """Run one BFCL category against one model."""
+class _Harness:
+    """Shared plumbing: yielding, and requests that can be abandoned."""
 
     def __init__(self, client: OmlxClient, db: DB, unit: WorkUnit, env_hash: str, run_id: int):
         self.client = client
@@ -107,7 +108,15 @@ class ToolsExecution:
             raise box["exc"]
         return box["resp"]
 
-    # -- the suite ------------------------------------------------------------
+    def finish(self, status: str, error: str | None, recorded: int, total: int) -> None:
+        self.db.finish_run(self.run_id, status=status, cancel_reason=self.cancel_reason,
+                           error=error)
+        log.info("run %s %s%s (%d/%d recorded)", self.run_id, status,
+                 f" ({self.cancel_reason})" if self.cancel_reason else "", recorded, total)
+
+
+class ToolsExecution(_Harness):
+    """Run one BFCL category against one model."""
 
     def run(self) -> None:
         p = self.spec.p
@@ -172,10 +181,7 @@ class ToolsExecution:
             self.db.mark_spec(self.model.model_id, self.spec.key, self.model.settings_fingerprint,
                               ok=False, run_id=self.run_id, error=error,
                               environment_hash=self.env_hash)
-        self.db.finish_run(self.run_id, status=status, cancel_reason=self.cancel_reason,
-                           error=error)
-        log.info("run %s %s%s (%d/%d cases recorded)", self.run_id, status,
-                 f" ({self.cancel_reason})" if self.cancel_reason else "", recorded["n"], len(cases))
+        self.finish(status, error, recorded["n"], len(cases))
 
     def record(self, case: bfcl.Case, resp: httpx.Response) -> None:
         try:
@@ -209,3 +215,77 @@ class ToolsExecution:
 def _looks_like_tool_call(text: str | None) -> bool:
     return bool(text) and any(m in text for m in ("<tool_call>", '"arguments"', "<function=",
                                                   "[TOOL_CALLS]"))
+
+
+class AgentTurnsExecution(_Harness):
+    """Replay the Hermes-shaped conversation and time every step.
+
+    Unlike tool cases, steps depend on the cache state the previous ones
+    left, so a cancelled replay is not resumed: the next run starts over
+    with a fresh session marker (cold first step).
+    """
+
+    def run(self) -> None:
+        from . import agent_turns
+
+        p = self.spec.p
+        thinking = p["enable_thinking"]
+        tools, requests = agent_turns.session()
+        status, error, recorded = "completed", None, 0
+        try:
+            self.rebaseline()
+            # Load the model (and JIT) outside the measurement.
+            self.ours_completed += self.chat({
+                "model": self.model.model_id, "max_tokens": 1,
+                "messages": [{"role": "user", "content": "Reply with OK."}]}).is_success
+            for step, messages in enumerate(requests, 1):
+                if reason := self.should_yield(ours_in_flight=0):
+                    self.cancel_reason = reason
+                    raise _Aborted()
+                body = {"model": self.model.model_id, "messages": messages, "tools": tools,
+                        "tool_choice": "auto", "max_tokens": agent_turns.MAX_TOKENS,
+                        "enable_thinking": thinking}
+                if thinking:
+                    body["reasoning_effort"] = "medium"
+                resp = self.chat(body)
+                if not resp.is_success or "error" in (data := resp.json()):
+                    # oMLX can return 200 with an error body (e.g. incomplete_tool_call)
+                    raise OmlxStepError(f"step {step}: HTTP {resp.status_code}: {resp.text[:300]}")
+                self.ours_completed += 1
+                self.record(step, data)
+                recorded += 1
+        except _Aborted:
+            status = "cancelled"
+            log.info("yielding the server (%s)", self.cancel_reason)
+        except (OmlxStepError, *NET_ERRORS) as e:
+            status, error = "error", str(e)
+            log.warning("  agent turns failed: %s", e)
+        if recorded == agent_turns.STEPS:
+            self.db.mark_spec(self.model.model_id, self.spec.key, self.model.settings_fingerprint,
+                              ok=True, run_id=self.run_id)
+        elif status == "error":
+            self.db.mark_spec(self.model.model_id, self.spec.key, self.model.settings_fingerprint,
+                              ok=False, run_id=self.run_id, error=error,
+                              environment_hash=self.env_hash)
+        self.finish(status, error, recorded, agent_turns.STEPS)
+
+    def record(self, step: int, data: dict) -> None:
+        u = data.get("usage") or {}
+        prompt = u.get("prompt_tokens") or 0
+        cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+        log.info("  step %d: %d prompt tokens, ttft %.1fs", step, prompt,
+                 u.get("time_to_first_token") or 0)
+        self.db.x(
+            "INSERT INTO agent_turns(run_id, model_id, spec_key, settings_fingerprint, step,"
+            " prompt_tokens, cached_tokens, completion_tokens, time_to_first_token,"
+            " prompt_tps, generation_tps, total_time, raw_json, recorded_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            self.run_id, self.model.model_id, self.spec.key, self.model.settings_fingerprint,
+            step, prompt, cached, u.get("completion_tokens"), u.get("time_to_first_token"),
+            u.get("prompt_tokens_per_second"), u.get("generation_tokens_per_second"),
+            u.get("total_time"), dumps(data), now(),
+        )
+
+
+class OmlxStepError(RuntimeError):
+    pass

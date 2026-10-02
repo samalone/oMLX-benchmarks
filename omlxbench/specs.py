@@ -62,6 +62,8 @@ class Spec:
             n = p["sample_size"] or "full"
             think = " thinking" if p["enable_thinking"] else ""
             return f"{p['suite']} n={n}{think}"
+        if self.kind == "agent_turns":
+            return f"agent turns {p['suite']}" + (" thinking" if p["enable_thinking"] else "")
         if self.kind == "tools":
             n = p["sample_size"] or "all"
             think = " thinking" if p["enable_thinking"] else ""
@@ -103,6 +105,13 @@ def tools(category: str, sample_size: int, enable_thinking: bool = True) -> Spec
     """BFCL v3 tool-calling category, run through oMLX's chat API."""
     return Spec.make("tools", suite="bfcl_v3", category=category, sample_size=sample_size,
                      enable_thinking=enable_thinking)
+
+
+def agent_turns(enable_thinking: bool = True) -> Spec:
+    """Replay of a Hermes-shaped, prefix-cached agent conversation."""
+    from .agent_turns import SUITE
+
+    return Spec.make("agent_turns", suite=SUITE, enable_thinking=enable_thinking)
 
 
 def context(target_tokens: int) -> Spec:
@@ -213,6 +222,8 @@ def load_targets(path: Path) -> Targets:
             specs += _context_specs(b["context"])
         if "tools" in b:
             specs += _tools_specs(b["tools"])
+        if "agent_turns" in b:
+            specs.append(agent_turns(bool(b["agent_turns"].get("enable_thinking", True))))
         if not specs:
             raise ValueError(f"targets.toml: [[benchmarks]] #{i + 1} defines no tests")
         groups.append(TargetGroup(

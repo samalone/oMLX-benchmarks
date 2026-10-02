@@ -10,7 +10,7 @@ def digest(db: DB) -> dict:
 
     def entry(model_id: str) -> dict:
         return models.setdefault(model_id, {"model_id": model_id, "perf": [], "accuracy": [],
-                                            "tools": [], "context": []})
+                                            "tools": [], "agent_turns": [], "context": []})
 
     for m in db.q(
         "SELECT * FROM model_snapshots s WHERE s.id = (SELECT max(id) FROM model_snapshots"
@@ -28,6 +28,7 @@ def digest(db: DB) -> dict:
             "perf": [],
             "accuracy": [],
             "tools": [],
+            "agent_turns": [],
             "context": [],
         }
 
@@ -60,6 +61,18 @@ def digest(db: DB) -> dict:
             "measured": t["recorded_at"],
         })
 
+    for a in db.q("SELECT * FROM v_agent_turns v WHERE run_id = (SELECT max(run_id) FROM"
+                  " v_agent_turns w WHERE w.model_id = v.model_id"
+                  " AND w.settings_fingerprint = v.settings_fingerprint)"):
+        entry(a["model_id"])["agent_turns"].append({
+            "first_prompt_tokens": a["first_prompt_tokens"], "cold_ttft_s": _r(a["cold_ttft_s"]),
+            "cold_prefill_tps": _r(a["cold_prefill_tps"], 0),
+            "warm_ttft_s": _r(a["warm_ttft_s"]), "warm_new_tokens": _r(a["warm_new_tokens"], 0),
+            "warm_prefill_tps": _r(a["warm_prefill_tps"], 0),
+            "last_prompt_tokens": a["last_prompt_tokens"], "last_ttft_s": _r(a["last_ttft_s"]),
+            "settings": a["settings_fingerprint"], "measured": a["recorded_at"],
+        })
+
     for c in db.q("SELECT * FROM v_context ORDER BY model_id, recorded_at"):
         entry(c["model_id"])["context"].append({
             "target_tokens": c["target_tokens"], "verified_tokens": c["verified_tokens"],
@@ -89,7 +102,7 @@ def markdown(d: dict) -> str:
         out.append(f"# oMLX benchmarks — {hw['chip']}, {hw['memory_gb']} GB, macOS {hw['macos']}, "
                    f"oMLX {hw['omlx']}\n")
     for m in d["models"]:
-        if not (m["perf"] or m["accuracy"] or m["tools"] or m["context"]):
+        if not (m["perf"] or m["accuracy"] or m["tools"] or m["agent_turns"] or m["context"]):
             continue
         bits = m.get("quant_bits")
         out.append(f"## {m['model_id']}")
@@ -113,6 +126,11 @@ def markdown(d: dict) -> str:
             for t in m["tools"]:
                 out.append(f"| {t['category']} | {t['n']} | {100 * (t['accuracy'] or 0):.1f}% | "
                            f"{t['avg_time_s']} |")
+        for a in m["agent_turns"]:
+            out.append(f"\nAgent turns ({a['first_prompt_tokens']}→{a['last_prompt_tokens']} tokens): "
+                       f"session start {a['cold_ttft_s']}s to first token; each later step "
+                       f"(~{a['warm_new_tokens']:.0f} new tokens) {a['warm_ttft_s']}s on average, "
+                       f"{a['last_ttft_s']}s at the end")
         for c in m["context"]:
             out.append(f"\nMax verified context: {c['verified_tokens']} tokens "
                        f"(target {c['target_tokens']}, capped by {c['capped_by']})")

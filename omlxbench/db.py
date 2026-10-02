@@ -291,8 +291,57 @@ LEFT JOIN model_snapshots m ON m.id = (SELECT max(id) FROM model_snapshots
 GROUP BY t.model_id, t.settings_fingerprint, t.spec_key;
 """
 
+_SCHEMA_V4 = """
+-- Hermes-shaped agent conversation replays: one row per measured step.
+-- Only runs with every step present are complete measurements.
+CREATE TABLE agent_turns (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    model_id TEXT NOT NULL,
+    spec_key TEXT NOT NULL,
+    settings_fingerprint TEXT NOT NULL,
+    step INTEGER NOT NULL,
+    prompt_tokens INTEGER,
+    cached_tokens INTEGER,             -- served from oMLX's prefix cache
+    completion_tokens INTEGER,
+    time_to_first_token REAL,          -- seconds
+    prompt_tps REAL,                   -- prefill speed over the uncached tokens
+    generation_tps REAL,
+    total_time REAL,
+    raw_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    UNIQUE (run_id, step)
+);
+
+-- One row per complete replay (run finished with every step). oMLX's
+-- reported cached_tokens is rounded to 4096-token cache blocks, so new
+-- tokens per step are taken as the growth of the prompt instead: each step's
+-- prompt is exactly the previous one plus an assistant turn and a tool result.
+CREATE VIEW v_agent_turns AS
+WITH s AS (
+    SELECT a.*, a.prompt_tokens - coalesce(
+               lag(a.prompt_tokens) OVER (PARTITION BY a.run_id ORDER BY a.step), 0) AS new_tokens
+    FROM agent_turns a
+    JOIN runs r ON r.id = a.run_id AND r.status = 'completed'
+)
+SELECT run_id, model_id, settings_fingerprint, spec_key, max(recorded_at) AS recorded_at,
+       count(*) AS steps,
+       max(CASE WHEN step = 1 THEN prompt_tokens END) AS first_prompt_tokens,
+       max(CASE WHEN step = 1 THEN time_to_first_token END) AS cold_ttft_s,
+       max(CASE WHEN step = 1 THEN prompt_tokens / time_to_first_token END) AS cold_prefill_tps,
+       avg(CASE WHEN step > 1 THEN time_to_first_token END) AS warm_ttft_s,
+       avg(CASE WHEN step > 1 THEN new_tokens END) AS warm_new_tokens,
+       sum(CASE WHEN step > 1 THEN new_tokens END)
+         / sum(CASE WHEN step > 1 THEN time_to_first_token END) AS warm_prefill_tps,
+       max(prompt_tokens) AS last_prompt_tokens,
+       max(CASE WHEN step = (SELECT max(step) FROM agent_turns b WHERE b.run_id = s.run_id)
+                THEN time_to_first_token END) AS last_ttft_s
+FROM s
+GROUP BY run_id;
+"""
+
 # Each entry upgrades the schema by one version. Append; never edit old ones.
-MIGRATIONS: list[str] = [_SCHEMA_V1, _SCHEMA_V2, _SCHEMA_V3]
+MIGRATIONS: list[str] = [_SCHEMA_V1, _SCHEMA_V2, _SCHEMA_V3, _SCHEMA_V4]
 
 
 class DB:
