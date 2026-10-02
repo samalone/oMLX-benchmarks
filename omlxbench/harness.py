@@ -230,14 +230,16 @@ class AgentTurnsExecution(_Harness):
 
         p = self.spec.p
         thinking = p["enable_thinking"]
-        tools, requests = agent_turns.session()
         status, error, recorded = "completed", None, 0
         try:
+            tools, requests = agent_turns.session()
             self.rebaseline()
             # Load the model (and JIT) outside the measurement.
-            self.ours_completed += self.chat({
-                "model": self.model.model_id, "max_tokens": 1,
-                "messages": [{"role": "user", "content": "Reply with OK."}]}).is_success
+            if self.chat({"model": self.model.model_id, "max_tokens": 1,
+                          "messages": [{"role": "user", "content": "Reply with OK."}]}).is_success:
+                self.ours_completed += 1
+            else:
+                self.rebaseline()  # unclear whether oMLX counted a rejected request
             for step, messages in enumerate(requests, 1):
                 if reason := self.should_yield(ours_in_flight=0):
                     self.cancel_reason = reason
@@ -257,7 +259,8 @@ class AgentTurnsExecution(_Harness):
         except _Aborted:
             status = "cancelled"
             log.info("yielding the server (%s)", self.cancel_reason)
-        except (OmlxStepError, *NET_ERRORS) as e:
+        except (OmlxStepError, OSError, ValueError, *NET_ERRORS) as e:
+            # OSError: corpus missing; ValueError: a non-JSON response body
             status, error = "error", str(e)
             log.warning("  agent turns failed: %s", e)
         if recorded == agent_turns.STEPS:
