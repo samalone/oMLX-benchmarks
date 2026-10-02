@@ -115,6 +115,11 @@ class App:
             until = datetime.now(timezone.utc) + _parse_duration(args.duration)
         set_pause(self.db, until, args.reason or "")
         print(f"paused {'until ' + until.astimezone().strftime('%Y-%m-%d %H:%M') if until else 'until resumed'}")
+        if daemon_alive(self.db):
+            # The runner notices within seconds and cancels safely (it waits
+            # for any request of yours on the model under test to finish).
+            print("the runner will cancel its current run")
+            return
         running = self.db.q("SELECT * FROM runs WHERE status='running' AND source='runner'")
         for run in running:
             try:
@@ -122,8 +127,7 @@ class App:
                 print(f"cancelled run {run['id']} ({run['kind']} on {run['model_id']})")
             except (OmlxError, OSError) as e:
                 print(f"could not cancel run {run['id']}: {e}", file=sys.stderr)
-            if not daemon_alive(self.db):
-                self.db.finish_run(run["id"], status="cancelled", cancel_reason="paused")
+            self.db.finish_run(run["id"], status="cancelled", cancel_reason="paused")
 
     def cmd_resume(self, args) -> None:
         clear_pause(self.db)

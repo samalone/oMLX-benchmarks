@@ -32,6 +32,7 @@ from .specs import Spec, Targets, accuracy, perf_batch, perf_single
 log = logging.getLogger("omlxbench")
 
 POLL_SECONDS = 2.0
+FAST_POLL_SECONDS = 0.5  # while waiting for a user request to finish
 IDLE_SLEEP_SECONDS = 15.0
 NOTHING_TO_DO_SLEEP_SECONDS = 300.0
 DRAIN_TIMEOUT_SECONDS = 120.0
@@ -286,6 +287,8 @@ class _Execution:
         self.request = request
         self.bench_id: str | None = None
         self.cancel_reason: str | None = None
+        self.yield_pending: str | None = None
+        self.guests_seen = 0
         self.phase: str | None = None
         self.terminal: dict | None = None
         self.recorded: set[str] = set()
@@ -353,10 +356,23 @@ class _Execution:
                     return
             elif time.monotonic() >= next_check:
                 next_check = time.monotonic() + POLL_SECONDS
-                reason = self.should_yield()
-                if reason:
-                    self.abort(reason)
-                    drain_deadline = time.monotonic() + DRAIN_TIMEOUT_SECONDS
+                reason = self.yield_pending or self.should_yield()
+                if not reason:
+                    continue
+                # Cancelling makes oMLX unload the benchmark's model with an
+                # immediate abort, which strands any user request on that
+                # same model (it hangs and never completes). So while the
+                # user is talking to the model under test, let the benchmark
+                # carry on and cancel only once their requests are done.
+                if self.user_requests_pending():
+                    if self.yield_pending is None:
+                        log.info("user request on %s; cancelling once it finishes",
+                                 self.unit.model.model_id)
+                    self.yield_pending = reason
+                    next_check = time.monotonic() + FAST_POLL_SECONDS
+                    continue
+                self.abort(reason)
+                drain_deadline = time.monotonic() + DRAIN_TIMEOUT_SECONDS
 
     def handle(self, ev: dict) -> None:
         t = ev.get("type")
@@ -395,11 +411,41 @@ class _Execution:
         return None
 
     def expected_in_flight(self) -> int:
+        """How many requests the benchmark itself has in flight right now."""
         if self.unit.kind == "perf":
-            return max([1, *self.request.get("batch_sizes", [])])
+            if self.phase == "batch":
+                return max([1, *self.request.get("batch_sizes", [])])
+            return 1
         if self.unit.kind == "accuracy":
             return self.request.get("batch_size", 1)
         return 1
+
+    def user_requests_pending(self) -> bool:
+        """Is a user request in flight on the benchmark's model?
+
+        /api/status counts every request in every engine, including ones
+        queued behind the benchmark's prefill (/activity misses those), so
+        subtract other models' requests (from /activity) and the benchmark's
+        own. Between two tests the benchmark briefly has none in flight, so a
+        lone user request can look like the benchmark's: once a guest has been
+        seen, also wait until that many API requests have completed.
+        """
+        try:
+            status = self.client.status()
+            activity = self.client.admin("GET", "/activity")
+        except (OmlxError, OSError):
+            return True  # can't tell; cancelling blind could strand a request
+        ours = self.unit.model.model_id
+        others = sum(
+            (m.get("active_requests") or 0) + (m.get("waiting_requests") or 0)
+            for m in (activity.get("active_models") or {}).get("models") or []
+            if m.get("id") != ours
+        )
+        in_flight = (status.get("active_requests") or 0) + (status.get("waiting_requests") or 0)
+        guests = in_flight - others - self.expected_in_flight()
+        self.guests_seen = max(self.guests_seen, guests)
+        completed = (status.get("total_requests") or 0) - (self.baseline or 0)
+        return guests > 0 or completed < self.guests_seen
 
     def abort(self, reason: str) -> None:
         if self.cancel_reason:
