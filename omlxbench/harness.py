@@ -66,23 +66,31 @@ class _Harness:
         self.baseline = (self.client.status().get("total_requests") or 0) - self.ours_completed
 
     def should_yield(self, ours_in_flight: int) -> str | None:
+        reason, why = self._yield_signal(ours_in_flight)
+        if reason:
+            log.info("  yield signal: %s", why)
+        return reason
+
+    def _yield_signal(self, ours_in_flight: int) -> tuple[str | None, str]:
         if pause_state(self.db)[0]:
-            return "paused"
+            return "paused", "pause requested"
         try:
             status = self.client.status()
         except NET_ERRORS:
-            return None
+            return None, ""
         loaded = status.get("loaded_models") or []
-        if (status.get("total_requests") or 0) - self.baseline > self.ours_completed:
-            return "user_traffic"
+        completed = (status.get("total_requests") or 0) - self.baseline
+        if completed > self.ours_completed:
+            return "user_traffic", f"{completed} API requests completed, {self.ours_completed} ours"
         self.rejected_total += self.rejected.new()
         if self.rejected_total > self.ours_rejected:
-            return "user_traffic"  # oMLX turned someone else's request away
+            return "user_traffic", (f"{self.rejected_total} API requests rejected,"
+                                    f" {self.ours_rejected} ours")
         if in_flight(status) > ours_in_flight:
-            return "user_traffic"
+            return "user_traffic", f"{in_flight(status)} requests in flight, {ours_in_flight} ours"
         if status.get("models_loading") and self.model.model_id in loaded:
-            return "user_traffic"  # loading something else, for someone else
-        return None
+            return "user_traffic", "another model is loading"  # for someone else
+        return None, ""
 
     # -- one request ----------------------------------------------------------
 
