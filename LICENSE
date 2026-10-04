@@ -19,14 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Bundled data under omlxbench/data/ keeps its own license:
-
-- omlxbench/data/bfcl_v3/: Berkeley Function Calling Leaderboard v3 test cases,
-  Apache License 2.0, (c) the Gorilla LLM authors.
-- omlxbench/data/agent_turns/: unmodified CPython 3.11 standard library source,
-  Python Software Foundation License.
-
-See the README.md in each directory.
