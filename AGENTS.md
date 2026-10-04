@@ -9,6 +9,7 @@ and make recommendations for this specific machine and its owner.
 ```sh
 uv run omlxbench report --json   # compact per-model digest; start here
 uv run omlxbench report          # same, as markdown tables
+uv run omlxbench html            # sortable HTML tables for people (data/reports/)
 uv run omlxbench status          # is the runner up, what is it doing, what's missing
 uv run omlxbench plan            # every run still needed to satisfy targets.toml
 ```

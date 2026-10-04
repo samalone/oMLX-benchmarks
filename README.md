@@ -70,6 +70,7 @@ Optional environment variables (in `.env` or the environment): `OMLX_URL`
 ```sh
 uv run omlxbench status        # runner state, current run, what's missing, recent runs
 uv run omlxbench report        # latest results per model (add --json for agents)
+uv run omlxbench html          # sortable HTML report in data/reports/, opened in the browser
 uv run omlxbench pause 2h      # keep the server free; `pause` alone = until resumed
 uv run omlxbench resume
 uv run omlxbench requeue --model 'Qwen*' --spec 'perf.single:*' --yes   # measure again

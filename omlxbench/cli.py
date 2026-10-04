@@ -9,6 +9,7 @@ import logging
 import re
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from .client import NET_ERRORS, OmlxClient
 from .config import load_config
@@ -134,6 +135,20 @@ class App:
         d = digest(self.db)
         print(json.dumps(d, indent=2) if args.json else markdown(d))
 
+    def cmd_html(self, args) -> None:
+        import webbrowser
+
+        from .html_report import render
+        from .report import digest
+
+        now = datetime.now()
+        path = args.output or self.cfg.db_path.parent / "reports" / f"report-{now:%Y%m%d-%H%M%S}.html"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(render(digest(self.db), now), encoding="utf-8")
+        print(path)
+        if not args.no_open:
+            webbrowser.open(path.resolve().as_uri())
+
     def cmd_import_ui(self, args) -> None:
         from .importer import import_ui
 
@@ -204,6 +219,11 @@ def main(argv: list[str] | None = None) -> None:
 
     p = sub.add_parser("report", help="latest results per model")
     p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("html", help="write a sortable HTML report and open it in the browser")
+    p.add_argument("-o", "--output", type=Path, help="file to write (default: "
+                   "data/reports/report-<timestamp>.html)")
+    p.add_argument("--no-open", action="store_true", help="don't open it in the browser")
 
     p = sub.add_parser("import-ui", help="import results of runs started in the oMLX web UI")
     p.add_argument("--bench-id", action="append", help="perf bench id (default: found in logs)")
