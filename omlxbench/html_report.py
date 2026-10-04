@@ -73,6 +73,8 @@ def _pct(a: dict | None) -> Cell:
 
 def _get(p: dict | None, key: str, scale: float = 1) -> Cell:
     v = None if p is None else p.get(key)
+    if key == "peak_mem_gb" and not v:
+        v = None  # the digest reports a missing peak memory as 0
     return Cell(None if v is None else v * scale)
 
 
@@ -115,7 +117,9 @@ def _tables(d: dict) -> list[tuple[str, str, list[Col], list[tuple[dict, list[Ce
     cols += [Col(s, HIGH, 1, "%") for s in suites]
     body = []
     for r in rows:
-        m, at, ctx = r["model"], first(r["agent_turns"]), first(r["context"])
+        # v_context keeps every measurement, oldest first: use the newest.
+        m, at = r["model"], first(r["agent_turns"])
+        ctx = r["context"][-1] if r["context"] else None
         cells = [Cell(m.get("quant_bits")), Cell(m.get("size_gb")),
                  _get(at, "warm_ttft_s"), _get(at, "cold_ttft_s")]
         if decode_pp:
@@ -329,8 +333,8 @@ document.querySelectorAll("table").forEach(table => {{
       const x = a.cells[i].dataset.v, y = b.cells[i].dataset.v;
       if (x === undefined || y === undefined)  // missing values always sink
         return (x === undefined) - (y === undefined);
-      const nx = parseFloat(x), ny = parseFloat(y);
-      const c = isNaN(nx) || isNaN(ny) ? x.localeCompare(y) : nx - ny;
+      const nx = Number(x), ny = Number(y);
+      const c = th.dataset.type === "text" || isNaN(nx) || isNaN(ny) ? x.localeCompare(y) : nx - ny;
       return sign * c;
     }});
     rows.forEach(r => tbody.appendChild(r));
