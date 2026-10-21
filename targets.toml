@@ -15,7 +15,8 @@ quiet_minutes = 10        # no API traffic for this long before a run starts
 
 [models]
 include = ["*"]           # glob patterns against oMLX model ids
-exclude = []
+# clef-flash is not a chat model: it can't be driven through the chat API.
+exclude = ["clef-flash-*"]
 types = ["llm", "vlm"]
 
 # Tier 1 (done for all models): the oMLX web UI defaults, a quick speed
