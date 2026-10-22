@@ -218,13 +218,7 @@ def _table_html(cols: list[Col], body: list[tuple[dict, list[Cell]]]) -> str:
     body = [(r, cells) for r, cells in body if any(c.value is not None for c in cells)]
     if not body:
         return "<p class=empty>No data yet.</p>"
-    best = []
-    for i, col in enumerate(cols):
-        vals = [cells[i].value for _, cells in body if cells[i].value is not None]
-        # Rounded, so values that display identically tie for best.
-        vals = [round(v, col.nd) for v in vals]
-        best.append(None if col.better is None or len(vals) < 2 or len(set(vals)) < 2
-                    else (max if col.better == HIGH else min)(vals))
+    # The best cells are highlighted by the page script, over the visible rows only.
     out = ["<table><thead><tr><th data-type=text>Model</th>"]
     for col in cols:
         arrow = {HIGH: " ↑", LOW: " ↓"}.get(col.better, "")
@@ -232,21 +226,23 @@ def _table_html(cols: list[Col], body: list[tuple[dict, list[Cell]]]) -> str:
         if col.better:
             tip = (tip + " — " if tip else "") + ("higher" if col.better == HIGH else "lower") \
                 + " is better"
-        out.append(f'<th data-better="{col.better or ""}" title="{escape(tip)}">'
+        out.append(f'<th data-better="{col.better or ""}" data-nd={col.nd} title="{escape(tip)}">'
                    f"{escape(col.label)}<span class=dir>{arrow}</span></th>")
     out.append("</tr></thead><tbody>")
     for r, cells in body:
         m = r["model"]
         tag = "" if r["settings"] == "baseline" else f' <span class=fp>{escape(r["settings"])}</span>'
-        out.append(f'<tr><td class=model data-v="{escape(m["model_id"])}">'
-                   f'{escape(m["model_id"])}{tag}</td>')
-        for i, (col, c) in enumerate(zip(cols, cells)):
+        gone = not m.get("installed", True)
+        if gone:
+            tag += " <span class=gone-tag>removed</span>"
+        out.append(f'<tr{" class=gone" if gone else ""}><td class=model '
+                   f'data-v="{escape(m["model_id"])}">{escape(m["model_id"])}{tag}</td>')
+        for col, c in zip(cols, cells):
             if c.value is None:
                 out.append("<td class=na>—</td>")
                 continue
-            cls = ' class=best' if best[i] is not None and round(c.value, col.nd) == best[i] else ""
             title = f' title="{escape(c.title)}"' if c.title else ""
-            out.append(f'<td data-v="{c.value}"{cls}{title}>{_fmt(c.value, col)}</td>')
+            out.append(f'<td data-v="{c.value}"{title}>{_fmt(c.value, col)}</td>')
         out.append("</tr>")
     out.append("</tbody></table>")
     return "".join(out)
@@ -260,8 +256,11 @@ def render(d: dict, generated: datetime) -> str:
     for title, note, cols, body in _tables(d):
         sections.append(f"<section><h2>{escape(title)}</h2><p class=note>{escape(note)}</p>"
                         f"<div class=scroll>{_table_html(cols, body)}</div></section>")
-    return _PAGE.format(
-        generated=generated.strftime("%Y-%m-%d %H:%M"), sub=sub, sections="\n".join(sections))
+    gone = sum(not m.get("installed", True) for m in d["models"])
+    toggle = (f'<label class=toggle><input type=checkbox id=show-gone> Show {gone} removed '
+              f'model{"" if gone == 1 else "s"} (no longer on disk)</label>' if gone else "")
+    return _PAGE.format(generated=generated.strftime("%Y-%m-%d %H:%M"), sub=sub,
+                        toggle=toggle, sections="\n".join(sections))
 
 
 _PAGE = """<!doctype html>
@@ -310,16 +309,49 @@ tbody tr:last-child td {{ border-bottom: 0; }}
 .fp {{ font-size: 11px; background: var(--tag); color: var(--tag-fg); padding: 1px 6px;
   border-radius: 4px; font-weight: 500; }}
 .empty {{ padding: 12px; margin: 0; color: var(--muted); }}
+.toggle {{ display: inline-flex; gap: 6px; align-items: center; font-size: 13px; cursor: pointer; }}
+body:not(.show-gone) tr.gone {{ display: none; }}
+tr.gone td {{ color: var(--muted); }}
+.gone-tag {{ font-size: 11px; border: 1px solid var(--line); color: var(--muted);
+  padding: 0 6px; border-radius: 4px; font-weight: 500; }}
 </style></head>
 <body><main>
 <h1>oMLX benchmarks</h1>
 <p class=sub>{sub}<br>Generated {generated}</p>
-<p class=legend><span class=best>Highlighted</span> cells are the best in their column.
+<p class=legend><span class=best>Highlighted</span> cells are the best in their column among the models shown.
 Click a column head to sort; click again to reverse. Speed figures are single trials,
 so differences under ~5% are noise.</p>
+{toggle}
 {sections}
 </main>
 <script>
+// Highlight the best value in each column among the rows currently shown,
+// rounded as displayed so values that look identical tie.
+function highlightBest() {{
+  const showGone = document.body.classList.contains("show-gone");
+  document.querySelectorAll("table").forEach(table => {{
+    const rows = [...table.tBodies[0].rows].filter(r => showGone || !r.classList.contains("gone"));
+    [...table.tHead.rows[0].cells].forEach((th, i) => {{
+      const better = th.dataset.better, nd = Number(th.dataset.nd);
+      const cells = [...table.tBodies[0].rows].map(r => r.cells[i]);
+      cells.forEach(c => c.classList.remove("best"));
+      if (!better) return;
+      const val = c => Number(Number(c.dataset.v).toFixed(nd));
+      const shown = rows.map(r => r.cells[i]).filter(c => c.dataset.v !== undefined);
+      const vals = shown.map(val);
+      if (new Set(vals).size < 2) return;
+      const best = better === "high" ? Math.max(...vals) : Math.min(...vals);
+      shown.forEach(c => {{ if (val(c) === best) c.classList.add("best"); }});
+    }});
+  }});
+}}
+const showGone = document.getElementById("show-gone");
+if (showGone) showGone.addEventListener("change", () => {{
+  document.body.classList.toggle("show-gone", showGone.checked);
+  highlightBest();
+}});
+highlightBest();
+
 document.querySelectorAll("table").forEach(table => {{
   const heads = [...table.tHead.rows[0].cells];
   heads.forEach((th, i) => th.addEventListener("click", () => {{

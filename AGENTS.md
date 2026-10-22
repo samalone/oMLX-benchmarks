@@ -14,6 +14,10 @@ uv run omlxbench status          # is the runner up, what is it doing, what's mi
 uv run omlxbench plan            # every run still needed to satisfy targets.toml
 ```
 
+Each digest entry has `installed`: false once the model's weights are gone from disk.
+Its results stay in the database; the HTML report hides it unless you tick the
+"show removed models" box.
+
 For anything the digest doesn't answer, query the database directly:
 `sqlite3 data/omlxbench.sqlite3` (read-only use is always safe; the runner uses WAL).
 

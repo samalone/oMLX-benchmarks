@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .db import DB
 
 
@@ -9,7 +11,8 @@ def digest(db: DB) -> dict:
     models: dict[str, dict] = {}
 
     def entry(model_id: str) -> dict:
-        return models.setdefault(model_id, {"model_id": model_id, "perf": [], "accuracy": [],
+        return models.setdefault(model_id, {"model_id": model_id, "installed": True,
+                                            "perf": [], "accuracy": [],
                                             "tools": [], "agent_turns": [], "context": []})
 
     for m in db.q(
@@ -25,6 +28,8 @@ def digest(db: DB) -> dict:
             "size_gb": round((m["size_bytes"] or 0) / 1e9, 2),
             "native_context": m["native_context"],
             "current_settings_fingerprint": m["settings_fingerprint"],
+            # False once the weights are deleted; their results stay in the database.
+            "installed": not m["model_path"] or Path(m["model_path"]).is_dir(),
             "perf": [],
             "accuracy": [],
             "tools": [],
