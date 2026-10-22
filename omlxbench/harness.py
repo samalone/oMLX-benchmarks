@@ -35,6 +35,10 @@ log = logging.getLogger("omlxbench")
 POLL_SECONDS = 2.0
 REQUEST_TIMEOUT_SECONDS = 900.0
 MAX_CONSECUTIVE_ERRORS = 3
+# Responses meaning oMLX could not serve the model at all (unknown model, a
+# failed load, no memory to load it), as opposed to rejecting one request.
+# Scoring these as wrong answers would record a model that never ran.
+UNSERVABLE_STATUSES = (404, 409, 503, 507)
 
 
 class _Aborted(Exception):
@@ -182,6 +186,14 @@ class ToolsExecution(_Harness):
         status, error, errors = "completed", None, 0
         try:
             self.rebaseline()
+            if pending:
+                # Load the model before the first case, and stop here if it can't be.
+                resp = self.chat({"model": self.model.model_id, "max_tokens": 1,
+                                  "messages": [{"role": "user", "content": "Reply with OK."}]})
+                if not resp.is_success:
+                    self.ours_rejected += 1
+                    raise OmlxStepError(f"warm-up: HTTP {resp.status_code}: {resp.text[:300]}")
+                self.ours_completed += 1
             for i, case in enumerate(pending, 1):
                 if reason := self.should_yield(ours_in_flight=0):
                     self.cancel_reason = reason
@@ -208,6 +220,9 @@ class ToolsExecution(_Harness):
                     self.rebaseline()
                     continue
                 errors = 0
+                if resp.status_code in UNSERVABLE_STATUSES:
+                    self.ours_rejected += 1
+                    raise OmlxStepError(f"{case.id}: HTTP {resp.status_code}: {resp.text[:300]}")
                 self.record(case, resp)
                 if resp.is_success:
                     self.ours_completed += 1
@@ -219,8 +234,9 @@ class ToolsExecution(_Harness):
         except _Aborted:
             status = "cancelled"
             log.info("yielding the server (%s)", self.cancel_reason)
-        except NET_ERRORS as e:
+        except (OmlxStepError, *NET_ERRORS) as e:
             status, error = "error", str(e)
+            log.warning("  tools run failed: %s", e)
         recorded = self.db.q1(
             "SELECT count(*) AS n, sum(correct) AS ok FROM tool_cases"
             " WHERE model_id=? AND spec_key=? AND settings_fingerprint=?",
