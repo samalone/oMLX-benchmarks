@@ -186,13 +186,17 @@ def _tables(d: dict) -> list[tuple[str, str, list[Col], list[tuple[dict, list[Ce
         cols = [Col("Overall", HIGH, 1, "%")] + [Col(c, HIGH, 1, "%") for c in cats]
         cols += [Col("Avg s/case", LOW, 1), Col("Avg tokens/case", LOW, 0,
                                                  title="Completion tokens, including thinking")]
+        def mean(ts, key):
+            # Weighted by cases, over categories that report it: failed requests
+            # (e.g. a model that never loaded) have no timing or token counts.
+            ts = [t for t in ts if t[key] is not None]
+            n = sum(t["n"] for t in ts)
+            return Cell(sum(t["n"] * t[key] for t in ts) / n if n else None)
+
         body = []
         for r in rows:
-            ts = r["tools"]
-            n = sum(t["n"] for t in ts) or None
             cells = [_tools_overall(r)] + [_pct(cat(r, c)) for c in cats]
-            cells += [Cell(n and sum(t["n"] * (t["avg_time_s"] or 0) for t in ts) / n),
-                      Cell(n and sum(t["n"] * (t["avg_completion_tokens"] or 0) for t in ts) / n)]
+            cells += [mean(r["tools"], "avg_time_s"), mean(r["tools"], "avg_completion_tokens")]
             body.append((r, cells))
         tables.append(("Tool calling", "BFCL v3 through the chat API with thinking on. "
                        "Hover a score for the sample size.", cols, body))
