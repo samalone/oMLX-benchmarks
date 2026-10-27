@@ -10,7 +10,7 @@ and make recommendations for this specific machine and its owner.
 uv run omlxbench report --json   # compact per-model digest; start here
 uv run omlxbench report          # same, as markdown tables
 uv run omlxbench html            # sortable HTML tables for people (data/reports/)
-                                 # the runner serves the same page live: http://127.0.0.1:8765/
+                                 # the runner serves it live, auto-refreshing: http://127.0.0.1:8765/
 uv run omlxbench status          # is the runner up, what is it doing, what's missing
 uv run omlxbench plan            # every run still needed to satisfy targets.toml
 ```

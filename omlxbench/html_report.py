@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from html import escape
@@ -248,7 +249,9 @@ def _table_html(cols: list[Col], body: list[tuple[dict, list[Cell]]]) -> str:
     return "".join(out)
 
 
-def render(d: dict, generated: datetime) -> str:
+def render(d: dict, generated: datetime, version: str | None = None) -> str:
+    """With a `version`, the page is served live: it polls /version and reloads
+    itself when the results change, keeping its sort order, toggle and scroll."""
     hw = d.get("hardware")
     sub = (f"{escape(hw['chip'])}, {hw['memory_gb']} GB, {hw['gpu_cores']} GPU cores · "
            f"macOS {escape(hw['macos'])} · oMLX {escape(hw['omlx'])}" if hw else "")
@@ -259,8 +262,10 @@ def render(d: dict, generated: datetime) -> str:
     gone = sum(not m.get("installed", True) for m in d["models"])
     toggle = (f'<label class=toggle><input type=checkbox id=show-gone> Show {gone} removed '
               f'model{"" if gone == 1 else "s"} (no longer on disk)</label>' if gone else "")
-    return _PAGE.format(generated=generated.strftime("%Y-%m-%d %H:%M"), sub=sub,
-                        toggle=toggle, sections="\n".join(sections))
+    live = (" · <span class=live>updates when new results arrive</span>" if version else "")
+    script = _LIVE_SCRIPT.replace("__VERSION__", json.dumps(version)) if version else ""
+    return _PAGE.format(generated=generated.strftime("%Y-%m-%d %H:%M"), sub=sub, live=live,
+                        toggle=toggle, sections="\n".join(sections), live_script=script)
 
 
 _PAGE = """<!doctype html>
@@ -312,12 +317,13 @@ tbody tr:last-child td {{ border-bottom: 0; }}
 .toggle {{ display: inline-flex; gap: 6px; align-items: center; font-size: 13px; cursor: pointer; }}
 body:not(.show-gone) tr.gone {{ display: none; }}
 tr.gone td {{ color: var(--muted); }}
+.live::before {{ content: "● "; color: #2f9e5a; }}
 .gone-tag {{ font-size: 11px; border: 1px solid var(--line); color: var(--muted);
   padding: 0 6px; border-radius: 4px; font-weight: 500; }}
 </style></head>
 <body><main>
 <h1>oMLX benchmarks</h1>
-<p class=sub>{sub}<br>Generated {generated}</p>
+<p class=sub>{sub}<br>Generated {generated}{live}</p>
 <p class=legend><span class=best>Highlighted</span> cells are the best in their column among the models shown.
 Click a column head to sort; click again to reverse. Speed figures are single trials,
 so differences under ~5% are noise.</p>
@@ -352,30 +358,78 @@ if (showGone) showGone.addEventListener("change", () => {{
 }});
 highlightBest();
 
+function sortTable(table, i, dir) {{
+  const heads = [...table.tHead.rows[0].cells], th = heads[i];
+  heads.forEach(h => h.removeAttribute("aria-sort"));
+  th.setAttribute("aria-sort", dir);
+  const sign = dir === "ascending" ? 1 : -1;
+  const tbody = table.tBodies[0];
+  const rows = [...tbody.rows];
+  rows.sort((a, b) => {{
+    const x = a.cells[i].dataset.v, y = b.cells[i].dataset.v;
+    if (x === undefined || y === undefined)  // missing values always sink
+      return (x === undefined) - (y === undefined);
+    const nx = Number(x), ny = Number(y);
+    const c = th.dataset.type === "text" || isNaN(nx) || isNaN(ny) ? x.localeCompare(y) : nx - ny;
+    return sign * c;
+  }});
+  rows.forEach(r => tbody.appendChild(r));
+}}
+
 document.querySelectorAll("table").forEach(table => {{
   const heads = [...table.tHead.rows[0].cells];
   heads.forEach((th, i) => th.addEventListener("click", () => {{
-    const better = th.dataset.better;
     // First click puts the best values on top (or A→Z for text).
-    const first = better === "low" || th.dataset.type === "text" ? "ascending" : "descending";
+    const first = th.dataset.better === "low" || th.dataset.type === "text" ? "ascending" : "descending";
     const dir = th.getAttribute("aria-sort") === first
       ? (first === "ascending" ? "descending" : "ascending") : first;
-    heads.forEach(h => h.removeAttribute("aria-sort"));
-    th.setAttribute("aria-sort", dir);
-    const sign = dir === "ascending" ? 1 : -1;
-    const tbody = table.tBodies[0];
-    const rows = [...tbody.rows];
-    rows.sort((a, b) => {{
-      const x = a.cells[i].dataset.v, y = b.cells[i].dataset.v;
-      if (x === undefined || y === undefined)  // missing values always sink
-        return (x === undefined) - (y === undefined);
-      const nx = Number(x), ny = Number(y);
-      const c = th.dataset.type === "text" || isNaN(nx) || isNaN(ny) ? x.localeCompare(y) : nx - ny;
-      return sign * c;
-    }});
-    rows.forEach(r => tbody.appendChild(r));
+    sortTable(table, i, dir);
   }}));
 }});
 </script>
+{live_script}
 </body></html>
 """
+
+# Served pages only. The view state lives in sessionStorage, so a reload (ours
+# or the user's) comes back sorted, toggled and scrolled as it was.
+_LIVE_SCRIPT = """<script>
+const VERSION_SHOWN = __VERSION__, STATE_KEY = "omlxbench-view";
+
+function saveView() {
+  const sorts = [...document.querySelectorAll("table")].map(t => {
+    const i = [...t.tHead.rows[0].cells].findIndex(h => h.hasAttribute("aria-sort"));
+    return i < 0 ? null : [i, t.tHead.rows[0].cells[i].getAttribute("aria-sort")];
+  });
+  const gone = document.getElementById("show-gone");
+  try {
+    sessionStorage.setItem(STATE_KEY, JSON.stringify(
+      {sorts, showGone: !!(gone && gone.checked), scroll: [scrollX, scrollY]}));
+  } catch (e) {}
+}
+
+function restoreView() {
+  let v;
+  try { v = JSON.parse(sessionStorage.getItem(STATE_KEY)); } catch (e) {}
+  if (!v) return;
+  const tables = document.querySelectorAll("table");
+  (v.sorts || []).forEach((s, n) => { if (s && tables[n] && tables[n].tHead.rows[0].cells[s[0]])
+    sortTable(tables[n], s[0], s[1]); });
+  const gone = document.getElementById("show-gone");
+  if (gone && v.showGone) { gone.checked = true; document.body.classList.add("show-gone"); highlightBest(); }
+  if (v.scroll) scrollTo(v.scroll[0], v.scroll[1]);
+}
+
+async function checkForNewResults() {
+  if (document.hidden) return;
+  try {
+    const r = await fetch("version", {cache: "no-store"});
+    if (r.ok && (await r.text()).trim() !== VERSION_SHOWN) { saveView(); location.reload(); }
+  } catch (e) {}  // runner restarting: try again next time
+}
+
+restoreView();
+addEventListener("pagehide", saveView);
+document.addEventListener("visibilitychange", checkForNewResults);
+setInterval(checkForNewResults, 15000);
+</script>"""
