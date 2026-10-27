@@ -102,6 +102,10 @@ class App:
     def cmd_run(self, args) -> None:
         if args.dry_run:
             return self.cmd_plan(argparse.Namespace(failed=False))
+        if self.cfg.http_addr:
+            from .web import parse_addr, serve_in_background
+
+            serve_in_background(self.cfg.db_path, parse_addr(self.cfg.http_addr))
         Runner(self.client, self.db, self.targets, args.quiet_minutes).loop(once=args.once)
 
     def cmd_pause(self, args) -> None:
@@ -148,6 +152,17 @@ class App:
         print(path)
         if not args.no_open:
             webbrowser.open(path.resolve().as_uri())
+
+    def cmd_serve(self, args) -> None:
+        from .web import make_server, parse_addr
+
+        addr = parse_addr(args.addr or self.cfg.http_addr or "127.0.0.1:8765")
+        server = make_server(self.cfg.db_path, addr)
+        print(f"report at http://{addr[0]}:{addr[1]}/ (ctrl-c to stop)")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
 
     def cmd_import_ui(self, args) -> None:
         from .importer import import_ui
@@ -224,6 +239,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("-o", "--output", type=Path, help="file to write (default: "
                    "data/reports/report-<timestamp>.html)")
     p.add_argument("--no-open", action="store_true", help="don't open it in the browser")
+
+    p = sub.add_parser("serve", help="serve the HTML report over HTTP, fresh on every load "
+                       "(the runner already does this)")
+    p.add_argument("addr", nargs="?", help="[host:]port (default: OMLXBENCH_HTTP or "
+                   "127.0.0.1:8765)")
 
     p = sub.add_parser("import-ui", help="import results of runs started in the oMLX web UI")
     p.add_argument("--bench-id", action="append", help="perf bench id (default: found in logs)")

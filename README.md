@@ -63,7 +63,9 @@ launchd/install.sh uninstall   # remove it
 ```
 
 Optional environment variables (in `.env` or the environment): `OMLX_URL`
-(default `http://127.0.0.1:8000`), `OMLXBENCH_DB` and `OMLXBENCH_TARGETS`.
+(default `http://127.0.0.1:8000`), `OMLXBENCH_DB`, `OMLXBENCH_TARGETS` and
+`OMLXBENCH_HTTP` (where the runner serves the report: `[host:]port`, default
+`127.0.0.1:8765`; `off` disables it).
 
 ## Everyday use
 
@@ -71,6 +73,7 @@ Optional environment variables (in `.env` or the environment): `OMLX_URL`
 uv run omlxbench status        # runner state, current run, what's missing, recent runs
 uv run omlxbench report        # latest results per model (add --json for agents)
 uv run omlxbench html          # sortable HTML report in data/reports/, opened in the browser
+                               # (the runner also serves it live at http://127.0.0.1:8765/)
 uv run omlxbench pause 2h      # keep the server free; `pause` alone = until resumed
 uv run omlxbench resume
 uv run omlxbench requeue --model 'Qwen*' --spec 'perf.single:*' --yes   # measure again

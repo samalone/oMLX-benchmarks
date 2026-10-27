@@ -32,6 +32,7 @@ class Config:
     api_key: str
     db_path: Path
     targets_path: Path
+    http_addr: str  # where the runner serves the HTML report; empty = off
 
 
 def load_config() -> Config:
@@ -48,4 +49,5 @@ def load_config() -> Config:
         api_key=api_key,
         db_path=Path(get("OMLXBENCH_DB", str(PROJECT_ROOT / "data" / "omlxbench.sqlite3"))),
         targets_path=Path(get("OMLXBENCH_TARGETS", str(PROJECT_ROOT / "targets.toml"))),
+        http_addr="" if get("OMLXBENCH_HTTP").lower() == "off" else get("OMLXBENCH_HTTP", "127.0.0.1:8765"),
     )
