@@ -1,0 +1,532 @@
+{
+  "_about": "Synthetic chats for the pulse_memory suite (no real conversations). Each chat line is {at, who, text}, or {tool} for an unnumbered tool-outcome line. `expect` is checked loosely: `empty` means nothing new is worth keeping; `kinds`, `closed` and `claims` must appear among the reply's items, closed numbers and claim actions.",
+  "cases": [
+    {
+      "id": "small_talk",
+      "remembered": [],
+      "chat": [
+        {
+          "at": "Mon 2026-10-12 08:02",
+          "who": "User",
+          "text": "Morning! What's the weather looking like today?"
+        },
+        {
+          "at": "Mon 2026-10-12 08:02",
+          "who": "Hermes",
+          "text": "Good morning! It's 54°F and cloudy right now, warming to about 63°F this afternoon with a light breeze from the southwest. No rain expected until late tonight."
+        },
+        {
+          "at": "Mon 2026-10-12 08:03",
+          "who": "User",
+          "text": "Nice, thanks."
+        },
+        {
+          "at": "Mon 2026-10-12 08:03",
+          "who": "Hermes",
+          "text": "You're welcome. Have a good day!"
+        }
+      ],
+      "expect": {
+        "empty": true
+      }
+    },
+    {
+      "id": "dentist_commitment",
+      "remembered": [],
+      "chat": [
+        {
+          "at": "Mon 2026-10-12 12:04",
+          "who": "User",
+          "text": "Ugh, my tooth is still bugging me. Remind me to call the dentist tomorrow at 9."
+        },
+        {
+          "at": "Mon 2026-10-12 12:04",
+          "who": "Hermes",
+          "text": "Sorry to hear that. I'll make sure you get a reminder to call the dentist tomorrow at 9:00 AM. If the pain gets worse before then, most offices have an after-hours line for emergencies."
+        },
+        {
+          "at": "Mon 2026-10-12 12:05",
+          "who": "User",
+          "text": "Thanks, hopefully it's nothing."
+        }
+      ],
+      "expect": {
+        "kinds": [
+          "commitment"
+        ]
+      }
+    },
+    {
+      "id": "hermes_promise",
+      "remembered": [],
+      "chat": [
+        {
+          "at": "Tue 2026-10-13 17:40",
+          "who": "User",
+          "text": "The nightly build is still running and I'm heading out. Can you keep an eye on it?"
+        },
+        {
+          "at": "Tue 2026-10-13 17:41",
+          "who": "Hermes",
+          "text": "Sure. It's about 60% through the test stage now. I'll check the results first thing tomorrow morning and let you know whether anything failed."
+        },
+        {
+          "at": "Tue 2026-10-13 17:41",
+          "who": "User",
+          "text": "Perfect, see you tomorrow."
+        }
+      ],
+      "expect": {
+        "kinds": [
+          "promise"
+        ]
+      }
+    },
+    {
+      "id": "birthday_fact",
+      "remembered": [],
+      "chat": [
+        {
+          "at": "Wed 2026-10-14 20:15",
+          "who": "User",
+          "text": "I was looking at old photos tonight. My sister Priya's birthday is March 14 and I somehow forget it every single year."
+        },
+        {
+          "at": "Wed 2026-10-14 20:15",
+          "who": "Hermes",
+          "text": "That's a lovely way to spend an evening. March 14 is easy to tie to Pi Day, which might help it stick. Do you want me to suggest a few gift ideas closer to the date?"
+        },
+        {
+          "at": "Wed 2026-10-14 20:16",
+          "who": "User",
+          "text": "Ha, Pi Day, she'd love that. Maybe later."
+        }
+      ],
+      "expect": {
+        "kinds": [
+          "fact"
+        ]
+      }
+    },
+    {
+      "id": "closes_remembered",
+      "remembered": [
+        "#7 commitment: The user will renew their passport. (due 2026-10-16) (said 2026-10-02: \"I need to renew my passport before the 16th\")",
+        "#9 interest: The user is considering a trip to Lisbon in the spring. (said 2026-10-02: \"thinking about Lisbon in April\")"
+      ],
+      "chat": [
+        {
+          "at": "Thu 2026-10-15 10:30",
+          "who": "User",
+          "text": "Finally renewed my passport this morning. The line at the post office was ridiculous."
+        },
+        {
+          "at": "Thu 2026-10-15 10:30",
+          "who": "Hermes",
+          "text": "Congratulations, that's one less thing hanging over you! Expedited renewals usually arrive in two to three weeks, so it should be back well before any spring travel."
+        },
+        {
+          "at": "Thu 2026-10-15 10:31",
+          "who": "User",
+          "text": "Good, that was the plan."
+        }
+      ],
+      "expect": {
+        "closed": [
+          7
+        ]
+      }
+    },
+    {
+      "id": "claim_reminder",
+      "remembered": [],
+      "chat": [
+        {
+          "at": "Thu 2026-10-15 13:12",
+          "who": "User",
+          "text": "Can you remind me at 5 to pick up the dry cleaning?"
+        },
+        {
+          "tool": "cronjob create 'Pick up the dry cleaning' → ok, id R4471"
+        },
+        {
+          "at": "Thu 2026-10-15 13:12",
+          "who": "Hermes",
+          "text": "Done — I set a reminder for 5:00 PM today to pick up the dry cleaning."
+        },
+        {
+          "at": "Thu 2026-10-15 13:13",
+          "who": "User",
+          "text": "Great."
+        }
+      ],
+      "expect": {
+        "claims": [
+          "reminder"
+        ]
+      }
+    },
+    {
+      "id": "place_commitment",
+      "remembered": [],
+      "chat": [
+        {
+          "at": "Fri 2026-10-16 09:47",
+          "who": "User",
+          "text": "The printer just ran out of paper again. Next time I'm at Costco I need to grab a case of printer paper."
+        },
+        {
+          "at": "Fri 2026-10-16 09:47",
+          "who": "Hermes",
+          "text": "Noted. A case of ten reams usually lasts a home office several months. While you're there, it might be worth checking whether they carry the toner your printer uses, since it's often cheaper than ordering it online."
+        },
+        {
+          "at": "Fri 2026-10-16 09:48",
+          "who": "User",
+          "text": "Good idea, I'll look."
+        }
+      ],
+      "expect": {
+        "kinds": [
+          "commitment"
+        ]
+      }
+    },
+    {
+      "id": "price_watch",
+      "remembered": [],
+      "chat": [
+        {
+          "at": "Fri 2026-10-16 21:05",
+          "who": "User",
+          "text": "I really want the new Fujifilm X100 but it's $1,599 everywhere. Let me know if the price drops below $1,400."
+        },
+        {
+          "at": "Fri 2026-10-16 21:05",
+          "who": "Hermes",
+          "text": "Got it. Retailers often discount cameras around Black Friday and again in late January, so there's a decent chance it dips below $1,400 in the next few months. Used and refurbished units also show up at around $1,300."
+        },
+        {
+          "at": "Fri 2026-10-16 21:06",
+          "who": "User",
+          "text": "I'd rather buy new, but good to know."
+        }
+      ],
+      "expect": {
+        "kinds": [
+          "watch"
+        ]
+      }
+    },
+    {
+      "id": "quoted_message",
+      "remembered": [],
+      "chat": [
+        {
+          "at": "Sat 2026-10-17 11:20",
+          "who": "User",
+          "text": "Any new texts?"
+        },
+        {
+          "at": "Sat 2026-10-17 11:20",
+          "who": "Hermes",
+          "text": "One from Dana, 10 minutes ago: \"Hey! I'll bring the cake on Saturday, and my brother says he'll pick up the folding chairs Friday night. Can't wait!\""
+        },
+        {
+          "at": "Sat 2026-10-17 11:21",
+          "who": "User",
+          "text": "Cool, tell her thanks."
+        },
+        {
+          "at": "Sat 2026-10-17 11:21",
+          "who": "Hermes",
+          "text": "Sent: \"Thanks, Dana!\""
+        }
+      ],
+      "expect": {
+        "claims": [
+          "message"
+        ]
+      }
+    },
+    {
+      "id": "pulse_reminder_handoff",
+      "remembered": [
+        "#3 commitment: The user will call the plumber about the kitchen leak. (due 2026-10-17) (said 2026-10-14: \"I have to call the plumber about the leak by Saturday\") (reminded 2026-10-17)"
+      ],
+      "chat": [
+        {
+          "at": "Sat 2026-10-17 09:00",
+          "who": "User (Pulse's reminder)",
+          "text": "Pulse reminded me: call the plumber about the kitchen leak today."
+        },
+        {
+          "at": "Sat 2026-10-17 09:00",
+          "who": "Hermes (answering Pulse's reminder)",
+          "text": "Here's the number for Rivera Plumbing, the one you used last spring: (555) 014-2290. They open at 8 on Saturdays."
+        },
+        {
+          "at": "Sat 2026-10-17 09:31",
+          "who": "User",
+          "text": "Called them. They're coming Thursday afternoon to fix it."
+        },
+        {
+          "at": "Sat 2026-10-17 09:31",
+          "who": "Hermes",
+          "text": "Great, glad that's sorted. Thursday afternoon it is."
+        }
+      ],
+      "expect": {
+        "closed": [
+          3
+        ]
+      }
+    },
+    {
+      "id": "task_only_coding",
+      "remembered": [
+        "#12 fact: The user prefers Python for scripting. (said 2026-09-30: \"I do almost everything in Python\")"
+      ],
+      "chat": [
+        {
+          "at": "Sun 2026-10-18 14:02",
+          "who": "User",
+          "text": "My CSV import script crashes with UnicodeDecodeError: 'utf-8' codec can't decode byte 0x92 in position 1834. The file comes from our accounting system. Here's the line: `rows = list(csv.DictReader(open(path)))`"
+        },
+        {
+          "at": "Sun 2026-10-18 14:03",
+          "who": "Hermes",
+          "text": "Byte 0x92 is a right single quotation mark in Windows-1252, so the accounting system is almost certainly exporting cp1252 rather than UTF-8. Python opens files with UTF-8 by default on macOS, which is why it fails on the first curly apostrophe. Open it with the right encoding and newline handling: `with open(path, newline='', encoding='cp1252') as f: rows = list(csv.DictReader(f))`. The `newline=''` matters for csv: without it, quoted fields that contain line breaks can be split into two rows. If the exports are sometimes UTF-8 and sometimes cp1252, try UTF-8 first and fall back: read the bytes, attempt `data.decode('utf-8')`, and on UnicodeDecodeError use `data.decode('cp1252')`, then pass `io.StringIO(text)` to DictReader. Avoid `errors='ignore'`, since it silently drops characters from names and addresses."
+        },
+        {
+          "at": "Sun 2026-10-18 14:09",
+          "who": "User",
+          "text": "cp1252 worked. Now the amounts come through as strings like '1,234.50' and '(85.00)' for negatives. How do I turn those into numbers?"
+        },
+        {
+          "at": "Sun 2026-10-18 14:10",
+          "who": "Hermes",
+          "text": "Accounting exports use thousands separators and parentheses for negatives, so `float()` rejects both. Since this is money, use Decimal rather than float to avoid rounding surprises: `from decimal import Decimal` and then `def parse_amount(s): s = s.strip().replace(',', ''); neg = s.startswith('(') and s.endswith(')'); s = s.strip('()'); value = Decimal(s or '0'); return -value if neg else value`. That handles '1,234.50', '(85.00)', and an empty cell. If some rows have a currency symbol, add `.replace('$', '')`. When you sum them, keep everything as Decimal and only format at the end, for example `f\"{total:,.2f}\"`. One more thing worth checking: some systems put a trailing minus ('85.00-') instead of parentheses, so print a few unusual values before trusting the totals."
+        },
+        {
+          "at": "Sun 2026-10-18 14:22",
+          "who": "User",
+          "text": "Works. Totals match the report now. Last thing: the date column is '10/03/26'. Is that October 3rd?"
+        },
+        {
+          "at": "Sun 2026-10-18 14:23",
+          "who": "Hermes",
+          "text": "Almost certainly, since a US accounting system will use month/day/year. Parse it explicitly so there's no guessing: `datetime.strptime(s, '%m/%d/%y').date()`. The two-digit year maps 00-68 to 2000-2068, which is fine here. To be sure about the order, look for a row with a day above 12, like '10/25/26': if it parses with %m/%d/%y, the format is confirmed. If you later write the dates back out, ISO format (`d.isoformat()`) sorts correctly and avoids the ambiguity entirely."
+        },
+        {
+          "at": "Sun 2026-10-18 14:25",
+          "who": "User",
+          "text": "Confirmed, there's a 10/25 row. All good, thanks!"
+        },
+        {
+          "at": "Sun 2026-10-18 14:25",
+          "who": "Hermes",
+          "text": "Glad it's working. The script now reads cp1252, parses accounting amounts as Decimal and dates as month/day/year."
+        }
+      ],
+      "expect": {
+        "empty": true
+      }
+    },
+    {
+      "id": "mixed_long",
+      "remembered": [
+        "#21 commitment: The user will send the quarterly report to Marcus. (due 2026-10-23) (said 2026-10-15: \"the quarterly report has to go to Marcus by next Friday\")",
+        "#22 intention: The user wants to run three times a week. (said 2026-10-08: \"I want to get back to running three times a week\")",
+        "#23 promise: Hermes will look into cheaper car insurance quotes. (said 2026-10-11: \"I'll look into a few cheaper quotes for you\")",
+        "#24 fact: The user's partner is named Sam. (said 2026-09-28: \"Sam and I are going out tonight\")"
+      ],
+      "chat": [
+        {
+          "at": "Mon 2026-10-19 07:45",
+          "who": "User",
+          "text": "Busy week ahead. Reminder that the quarterly report still has to go to Marcus by Friday, and I haven't started the summary section."
+        },
+        {
+          "at": "Mon 2026-10-19 07:46",
+          "who": "Hermes",
+          "text": "Understood. If you block out an hour on Wednesday for the summary, that leaves Thursday for review and Friday morning to send it. Want me to draft an outline from last quarter's report so you're not starting from a blank page?"
+        },
+        {
+          "at": "Mon 2026-10-19 07:47",
+          "who": "User",
+          "text": "Yes please, that would help."
+        },
+        {
+          "at": "Mon 2026-10-19 07:52",
+          "who": "Hermes",
+          "text": "Here's an outline based on last quarter: 1. Headline numbers: revenue, margin, and the change from Q2. 2. What went well: the two enterprise renewals and the lower support backlog. 3. What didn't: the delayed onboarding redesign and its effect on trial conversions. 4. Risks for Q4: hiring for the platform team and the vendor contract renewal in December. 5. Asks: budget approval for the contractor and a decision on the pricing experiment. Each section can be two or three sentences; Marcus has said before that he prefers short summaries with the details in an appendix."
+        },
+        {
+          "at": "Mon 2026-10-19 08:05",
+          "who": "User",
+          "text": "That's great. Unrelated, I've been thinking a lot about learning to sail. There's a community sailing school on the river that does weekend classes in the spring."
+        },
+        {
+          "at": "Mon 2026-10-19 08:06",
+          "who": "Hermes",
+          "text": "That sounds like a great fit for the spring. Community programs usually start with a basic keelboat or small-boat course over two weekends, and many open registration in February or March. If you'd like, I can find the school's schedule and prices when their spring listings go up."
+        },
+        {
+          "at": "Mon 2026-10-19 08:07",
+          "who": "User",
+          "text": "Maybe. Also, I'm going to stop drinking coffee after 2pm. My sleep has been terrible."
+        },
+        {
+          "at": "Mon 2026-10-19 08:07",
+          "who": "Hermes",
+          "text": "That's a good change to try: caffeine's half-life is around five to six hours, so a 3 PM coffee is still half-active at 9 PM. Decaf or herbal tea in the afternoon can keep the ritual without the caffeine. Give it a week or two before judging the effect on your sleep."
+        },
+        {
+          "at": "Mon 2026-10-19 08:10",
+          "who": "User",
+          "text": "Will do. Oh, and did you ever find anything on the car insurance?"
+        },
+        {
+          "at": "Mon 2026-10-19 08:11",
+          "who": "Hermes",
+          "text": "Not yet, sorry. I'll pull together three quotes by Wednesday so you can compare them against your current policy before it renews."
+        },
+        {
+          "at": "Mon 2026-10-19 08:12",
+          "who": "User",
+          "text": "Thanks. Sam says hi, by the way."
+        },
+        {
+          "at": "Mon 2026-10-19 08:12",
+          "who": "Hermes",
+          "text": "Hi to Sam too! Good luck with the report this week."
+        }
+      ],
+      "expect": {
+        "kinds": [
+          "interest",
+          "intention"
+        ]
+      }
+    },
+    {
+      "id": "two_days_long",
+      "remembered": [
+        "#12 fact: The user prefers Python for scripting. (said 2026-09-30: \"I do almost everything in Python\")",
+        "#21 commitment: The user will send the quarterly report to Marcus. (due 2026-10-23) (said 2026-10-15: \"the quarterly report has to go to Marcus by next Friday\")",
+        "#22 intention: The user wants to run three times a week. (said 2026-10-08: \"I want to get back to running three times a week\")",
+        "#23 promise: Hermes will look into cheaper car insurance quotes. (said 2026-10-11: \"I'll look into a few cheaper quotes for you\")",
+        "#24 fact: The user's partner is named Sam. (said 2026-09-28: \"Sam and I are going out tonight\")"
+      ],
+      "chat": [
+        {
+          "at": "Sun 2026-10-18 14:02",
+          "who": "User",
+          "text": "My CSV import script crashes with UnicodeDecodeError: 'utf-8' codec can't decode byte 0x92 in position 1834. The file comes from our accounting system. Here's the line: `rows = list(csv.DictReader(open(path)))`"
+        },
+        {
+          "at": "Sun 2026-10-18 14:03",
+          "who": "Hermes",
+          "text": "Byte 0x92 is a right single quotation mark in Windows-1252, so the accounting system is almost certainly exporting cp1252 rather than UTF-8. Python opens files with UTF-8 by default on macOS, which is why it fails on the first curly apostrophe. Open it with the right encoding and newline handling: `with open(path, newline='', encoding='cp1252') as f: rows = list(csv.DictReader(f))`. The `newline=''` matters for csv: without it, quoted fields that contain line breaks can be split into two rows. If the exports are sometimes UTF-8 and sometimes cp1252, try UTF-8 first and fall back: read the bytes, attempt `data.decode('utf-8')`, and on UnicodeDecodeError use `data.decode('cp1252')`, then pass `io.StringIO(text)` to DictReader. Avoid `errors='ignore'`, since it silently drops characters from names and addresses."
+        },
+        {
+          "at": "Sun 2026-10-18 14:09",
+          "who": "User",
+          "text": "cp1252 worked. Now the amounts come through as strings like '1,234.50' and '(85.00)' for negatives. How do I turn those into numbers?"
+        },
+        {
+          "at": "Sun 2026-10-18 14:10",
+          "who": "Hermes",
+          "text": "Accounting exports use thousands separators and parentheses for negatives, so `float()` rejects both. Since this is money, use Decimal rather than float to avoid rounding surprises: `from decimal import Decimal` and then `def parse_amount(s): s = s.strip().replace(',', ''); neg = s.startswith('(') and s.endswith(')'); s = s.strip('()'); value = Decimal(s or '0'); return -value if neg else value`. That handles '1,234.50', '(85.00)', and an empty cell. If some rows have a currency symbol, add `.replace('$', '')`. When you sum them, keep everything as Decimal and only format at the end, for example `f\"{total:,.2f}\"`. One more thing worth checking: some systems put a trailing minus ('85.00-') instead of parentheses, so print a few unusual values before trusting the totals."
+        },
+        {
+          "at": "Sun 2026-10-18 14:22",
+          "who": "User",
+          "text": "Works. Totals match the report now. Last thing: the date column is '10/03/26'. Is that October 3rd?"
+        },
+        {
+          "at": "Sun 2026-10-18 14:23",
+          "who": "Hermes",
+          "text": "Almost certainly, since a US accounting system will use month/day/year. Parse it explicitly so there's no guessing: `datetime.strptime(s, '%m/%d/%y').date()`. The two-digit year maps 00-68 to 2000-2068, which is fine here. To be sure about the order, look for a row with a day above 12, like '10/25/26': if it parses with %m/%d/%y, the format is confirmed. If you later write the dates back out, ISO format (`d.isoformat()`) sorts correctly and avoids the ambiguity entirely."
+        },
+        {
+          "at": "Sun 2026-10-18 14:25",
+          "who": "User",
+          "text": "Confirmed, there's a 10/25 row. All good, thanks!"
+        },
+        {
+          "at": "Sun 2026-10-18 14:25",
+          "who": "Hermes",
+          "text": "Glad it's working. The script now reads cp1252, parses accounting amounts as Decimal and dates as month/day/year."
+        },
+        {
+          "at": "Mon 2026-10-19 07:45",
+          "who": "User",
+          "text": "Busy week ahead. Reminder that the quarterly report still has to go to Marcus by Friday, and I haven't started the summary section."
+        },
+        {
+          "at": "Mon 2026-10-19 07:46",
+          "who": "Hermes",
+          "text": "Understood. If you block out an hour on Wednesday for the summary, that leaves Thursday for review and Friday morning to send it. Want me to draft an outline from last quarter's report so you're not starting from a blank page?"
+        },
+        {
+          "at": "Mon 2026-10-19 07:47",
+          "who": "User",
+          "text": "Yes please, that would help."
+        },
+        {
+          "at": "Mon 2026-10-19 07:52",
+          "who": "Hermes",
+          "text": "Here's an outline based on last quarter: 1. Headline numbers: revenue, margin, and the change from Q2. 2. What went well: the two enterprise renewals and the lower support backlog. 3. What didn't: the delayed onboarding redesign and its effect on trial conversions. 4. Risks for Q4: hiring for the platform team and the vendor contract renewal in December. 5. Asks: budget approval for the contractor and a decision on the pricing experiment. Each section can be two or three sentences; Marcus has said before that he prefers short summaries with the details in an appendix."
+        },
+        {
+          "at": "Mon 2026-10-19 08:05",
+          "who": "User",
+          "text": "That's great. Unrelated, I've been thinking a lot about learning to sail. There's a community sailing school on the river that does weekend classes in the spring."
+        },
+        {
+          "at": "Mon 2026-10-19 08:06",
+          "who": "Hermes",
+          "text": "That sounds like a great fit for the spring. Community programs usually start with a basic keelboat or small-boat course over two weekends, and many open registration in February or March. If you'd like, I can find the school's schedule and prices when their spring listings go up."
+        },
+        {
+          "at": "Mon 2026-10-19 08:07",
+          "who": "User",
+          "text": "Maybe. Also, I'm going to stop drinking coffee after 2pm. My sleep has been terrible."
+        },
+        {
+          "at": "Mon 2026-10-19 08:07",
+          "who": "Hermes",
+          "text": "That's a good change to try: caffeine's half-life is around five to six hours, so a 3 PM coffee is still half-active at 9 PM. Decaf or herbal tea in the afternoon can keep the ritual without the caffeine. Give it a week or two before judging the effect on your sleep."
+        },
+        {
+          "at": "Mon 2026-10-19 08:10",
+          "who": "User",
+          "text": "Will do. Oh, and did you ever find anything on the car insurance?"
+        },
+        {
+          "at": "Mon 2026-10-19 08:11",
+          "who": "Hermes",
+          "text": "Not yet, sorry. I'll pull together three quotes by Wednesday so you can compare them against your current policy before it renews."
+        },
+        {
+          "at": "Mon 2026-10-19 08:12",
+          "who": "User",
+          "text": "Thanks. Sam says hi, by the way."
+        },
+        {
+          "at": "Mon 2026-10-19 08:12",
+          "who": "Hermes",
+          "text": "Hi to Sam too! Good luck with the report this week."
+        }
+      ],
+      "expect": {
+        "kinds": [
+          "interest",
+          "intention"
+        ]
+      }
+    }
+  ]
+}

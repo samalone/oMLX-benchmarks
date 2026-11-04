@@ -34,7 +34,7 @@ def _rows(d: dict) -> list[dict]:
     rows = []
     for m in d["models"]:
         fps = []
-        for section in ("perf", "accuracy", "tools", "agent_turns", "context"):
+        for section in ("perf", "accuracy", "tools", "agent_turns", "pulse_memory", "context"):
             for r in m[section]:
                 if r["settings"] not in fps:
                     fps.append(r["settings"])
@@ -42,7 +42,7 @@ def _rows(d: dict) -> list[dict]:
             rows.append({
                 "model": m, "settings": fp,
                 **{s: [r for r in m[s] if r["settings"] == fp]
-                   for s in ("perf", "accuracy", "tools", "agent_turns", "context")},
+                   for s in ("perf", "accuracy", "tools", "agent_turns", "pulse_memory", "context")},
             })
     return rows
 
@@ -70,6 +70,12 @@ def _pct(a: dict | None) -> Cell:
     if a.get("truncated"):
         note += f", {a['truncated']} truncated"
     return Cell(100 * a["accuracy"], note)
+
+
+def _rate(p: dict | None, key: str) -> Cell:
+    if p is None or p.get(key) is None:
+        return Cell(None)
+    return Cell(100 * p[key], f"{round(p[key] * p['n'])} of {p['n']} requests")
 
 
 def _get(p: dict | None, key: str, scale: float = 1) -> Cell:
@@ -114,7 +120,9 @@ def _tables(d: dict) -> list[tuple[str, str, list[Col], list[tuple[dict, list[Ce
                  Col(f"Peak GB @{_k(long_pp)}", LOW, 1, title="MLX peak memory")]
     cols += [Col("Max context", HIGH, 0, "k", title="Largest prompt actually prefilled "
                  "(thousands of tokens)"),
-             Col("Tool calls", HIGH, 1, "%", title="BFCL v3, all categories pooled")]
+             Col("Tool calls", HIGH, 1, "%", title="BFCL v3, all categories pooled"),
+             Col("Pulse memory", HIGH, 0, "%", title="Share of Pulse memory requests whose "
+                 "JSON reply Pulse accepts")]
     cols += [Col(s, HIGH, 1, "%") for s in suites]
     body = []
     for r in rows:
@@ -128,7 +136,8 @@ def _tables(d: dict) -> list[tuple[str, str, list[Col], list[tuple[dict, list[Ce
         if long_pp:
             p = _single(r, long_pp)
             cells += [_get(p, "pp_tps"), _get(p, "peak_mem_gb")]
-        cells += [_get(ctx, "verified_tokens", 1 / 1024), _tools_overall(r)]
+        cells += [_get(ctx, "verified_tokens", 1 / 1024), _tools_overall(r),
+                  _rate(first(r["pulse_memory"]), "pulse_ok")]
         cells += [_pct(suite(r, s)) for s in suites]
         body.append((r, cells))
     tables.append(("Overview", "One row per model and acceleration settings. "
@@ -201,6 +210,24 @@ def _tables(d: dict) -> list[tuple[str, str, list[Col], list[tuple[dict, list[Ce
             body.append((r, cells))
         tables.append(("Tool calling", "BFCL v3 through the chat API with thinking on. "
                        "Hover a score for the sample size.", cols, body))
+
+    cols = [Col("Pulse accepts", HIGH, 0, "%", title="Reply is a JSON object with an items "
+                "list, in time: what Pulse needs to keep anything"),
+            Col("Sensible", HIGH, 0, "%", title="Also well-formed items that fit the chat "
+                "(loose check)"),
+            Col("Cases failing", LOW, 0, title="Distinct chats with at least one rejected reply"),
+            Col("Avg s", LOW, 1), Col("Max s", LOW, 1, title="Pulse gives up after 120 s")]
+    body = []
+    for r in rows:
+        pm = first(r["pulse_memory"])
+        if pm is None:
+            continue
+        body.append((r, [_rate(pm, "pulse_ok"), _rate(pm, "content_ok"),
+                         _get(pm, "cases_with_failures"), _get(pm, "avg_time_s"),
+                         _get(pm, "max_time_s")]))
+    tables.append(("Pulse memory", "Hermes's Pulse plugin asking for memories as JSON "
+                   "(response_format json_object), synthetic chats, each sent several times. "
+                   "Hover a score for the number of requests.", cols, body))
 
     if suites:
         cols = [Col(s, HIGH, 1, "%") for s in suites]

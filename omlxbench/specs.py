@@ -68,6 +68,8 @@ class Spec:
             n = p["sample_size"] or "all"
             think = " thinking" if p["enable_thinking"] else ""
             return f"tools {p['category']} n={n}{think}"
+        if self.kind == "pulse_memory":
+            return f"pulse memory {p['suite']} ×{p['repeats']}"
         return f"context {p['target_tokens']}"
 
 
@@ -112,6 +114,13 @@ def agent_turns(enable_thinking: bool = True) -> Spec:
     from .agent_turns import SUITE
 
     return Spec.make("agent_turns", suite=SUITE, enable_thinking=enable_thinking)
+
+
+def pulse_memory(repeats: int = 3) -> Spec:
+    """Pulse's memory extraction (JSON output), each case `repeats` times."""
+    from .pulse_memory import SUITE
+
+    return Spec.make("pulse_memory", suite=SUITE, repeats=repeats)
 
 
 def context(target_tokens: int) -> Spec:
@@ -224,6 +233,11 @@ def load_targets(path: Path) -> Targets:
             specs += _tools_specs(b["tools"])
         if "agent_turns" in b:
             specs.append(agent_turns(bool(b["agent_turns"].get("enable_thinking", True))))
+        if "pulse_memory" in b:
+            repeats = int(b["pulse_memory"].get("repeats", 3))
+            if repeats < 1:
+                raise ValueError("targets.toml: pulse_memory repeats must be at least 1")
+            specs.append(pulse_memory(repeats))
         if not specs:
             raise ValueError(f"targets.toml: [[benchmarks]] #{i + 1} defines no tests")
         groups.append(TargetGroup(

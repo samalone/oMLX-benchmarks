@@ -171,18 +171,35 @@ class _Harness:
                  f" ({self.cancel_reason})" if self.cancel_reason else "", recorded, total)
 
 
-class ToolsExecution(_Harness):
-    """Run one BFCL category against one model."""
+class _CaseSuite(_Harness):
+    """A suite of independent chat requests, each recorded as it's scored,
+    so a cancelled run resumes from the cases still missing."""
+
+    what = "cases"
+
+    def cases(self) -> list[tuple[str, object]]:
+        """(key, case) for every case in the spec."""
+        raise NotImplementedError
+
+    def done(self) -> set[str]:
+        """Keys of cases already recorded for this model, spec and settings."""
+        raise NotImplementedError
+
+    def body(self, case) -> dict:
+        raise NotImplementedError
+
+    def record(self, case, resp: httpx.Response, elapsed: float) -> None:
+        raise NotImplementedError
+
+    def tally(self) -> tuple[int, int]:
+        """(recorded, passed)."""
+        raise NotImplementedError
 
     def run(self) -> None:
-        p = self.spec.p
-        thinking = p["enable_thinking"]
-        cases = bfcl.sample(p["category"], p["sample_size"])
-        done = {r["case_id"] for r in self.db.q(
-            "SELECT case_id FROM tool_cases WHERE model_id=? AND spec_key=? AND settings_fingerprint=?",
-            self.model.model_id, self.spec.key, self.model.settings_fingerprint)}
-        pending = [c for c in cases if c.id not in done]
-        log.info("  %d/%d %s cases to go", len(pending), len(cases), p["category"])
+        cases = self.cases()
+        done = self.done()
+        pending = [(k, c) for k, c in cases if k not in done]
+        log.info("  %d/%d %s to go", len(pending), len(cases), self.what)
         status, error, errors = "completed", None, 0
         try:
             self.rebaseline()
@@ -194,27 +211,16 @@ class ToolsExecution(_Harness):
                     self.ours_rejected += 1
                     raise OmlxStepError(f"warm-up: HTTP {resp.status_code}: {resp.text[:300]}")
                 self.ours_completed += 1
-            for i, case in enumerate(pending, 1):
+            for i, (key, case) in enumerate(pending, 1):
                 if reason := self.should_yield(ours_in_flight=0):
                     self.cancel_reason = reason
                     raise _Aborted()
-                body = {
-                    "model": self.model.model_id,
-                    "messages": case.messages,
-                    "tools": case.tools(),
-                    "tool_choice": "auto",
-                    # No sampling parameters, like Hermes: oMLX applies the
-                    # model's saved settings (each model's recommended values).
-                    "max_tokens": 8192 if thinking else 1024,
-                    "enable_thinking": thinking,
-                }
-                if thinking:
-                    body["reasoning_effort"] = "medium"  # what Hermes sends
+                t0 = time.monotonic()
                 try:
-                    resp = self.chat(body)
+                    resp = self.chat(self.body(case))
                 except NET_ERRORS as e:
                     errors += 1
-                    log.warning("  %s: request failed: %s", case.id, e)
+                    log.warning("  %s: request failed: %s", key, e)
                     if errors >= MAX_CONSECUTIVE_ERRORS:
                         raise
                     self.rebaseline()
@@ -222,37 +228,73 @@ class ToolsExecution(_Harness):
                 errors = 0
                 if resp.status_code in UNSERVABLE_STATUSES:
                     self.ours_rejected += 1
-                    raise OmlxStepError(f"{case.id}: HTTP {resp.status_code}: {resp.text[:300]}")
-                self.record(case, resp)
+                    raise OmlxStepError(f"{key}: HTTP {resp.status_code}: {resp.text[:300]}")
+                self.record(case, resp, time.monotonic() - t0)
                 if resp.is_success:
                     self.ours_completed += 1
                 else:
                     self.ours_rejected += 1
                     self.rebaseline()  # unclear whether oMLX counted a rejected request
                 if i % 10 == 0:
-                    log.info("  %s: %d/%d done", p["category"], len(done) + i, len(cases))
+                    log.info("  %s: %d/%d done", self.what, len(done) + i, len(cases))
         except _Aborted:
             status = "cancelled"
             log.info("yielding the server (%s)", self.cancel_reason)
         except (OmlxStepError, *NET_ERRORS) as e:
             status, error = "error", str(e)
-            log.warning("  tools run failed: %s", e)
-        recorded = self.db.q1(
-            "SELECT count(*) AS n, sum(correct) AS ok FROM tool_cases"
-            " WHERE model_id=? AND spec_key=? AND settings_fingerprint=?",
-            self.model.model_id, self.spec.key, self.model.settings_fingerprint)
-        if recorded["n"] >= len(cases):
+            log.warning("  %s run failed: %s", self.what, e)
+        n, ok = self.tally()
+        if n >= len(cases):
             self.db.mark_spec(self.model.model_id, self.spec.key, self.model.settings_fingerprint,
                               ok=True, run_id=self.run_id)
-            log.info("  result tools %s: %.1f%% (%s/%s)", p["category"],
-                     100 * (recorded["ok"] or 0) / recorded["n"], recorded["ok"], recorded["n"])
+            log.info("  result %s: %.1f%% (%s/%s)", self.what, 100 * ok / n if n else 0, ok, n)
         elif status == "error":
             self.db.mark_spec(self.model.model_id, self.spec.key, self.model.settings_fingerprint,
                               ok=False, run_id=self.run_id, error=error,
                               environment_hash=self.env_hash)
-        self.finish(status, error, recorded["n"], len(cases))
+        self.finish(status, error, n, len(cases))
 
-    def record(self, case: bfcl.Case, resp: httpx.Response) -> None:
+
+class ToolsExecution(_CaseSuite):
+    """Run one BFCL category against one model."""
+
+    @property
+    def what(self) -> str:
+        return f"tools {self.spec.p['category']}"
+
+    def cases(self) -> list[tuple[str, bfcl.Case]]:
+        p = self.spec.p
+        return [(c.id, c) for c in bfcl.sample(p["category"], p["sample_size"])]
+
+    def done(self) -> set[str]:
+        return {r["case_id"] for r in self.db.q(
+            "SELECT case_id FROM tool_cases WHERE model_id=? AND spec_key=? AND settings_fingerprint=?",
+            self.model.model_id, self.spec.key, self.model.settings_fingerprint)}
+
+    def body(self, case: bfcl.Case) -> dict:
+        thinking = self.spec.p["enable_thinking"]
+        body = {
+            "model": self.model.model_id,
+            "messages": case.messages,
+            "tools": case.tools(),
+            "tool_choice": "auto",
+            # No sampling parameters, like Hermes: oMLX applies the
+            # model's saved settings (each model's recommended values).
+            "max_tokens": 8192 if thinking else 1024,
+            "enable_thinking": thinking,
+        }
+        if thinking:
+            body["reasoning_effort"] = "medium"  # what Hermes sends
+        return body
+
+    def tally(self) -> tuple[int, int]:
+        r = self.db.q1(
+            "SELECT count(*) AS n, sum(correct) AS ok FROM tool_cases"
+            " WHERE model_id=? AND spec_key=? AND settings_fingerprint=?",
+            self.model.model_id, self.spec.key, self.model.settings_fingerprint)
+        return r["n"], r["ok"] or 0
+
+    def record(self, case: bfcl.Case, resp: httpx.Response, elapsed: float) -> None:
         try:
             data = resp.json()
         except ValueError:
@@ -363,5 +405,71 @@ class AgentTurnsExecution(_Harness):
         )
 
 
+class PulseMemoryExecution(_CaseSuite):
+    """Pulse's memory-extraction request, every case `repeats` times."""
+
+    what = "pulse memory"
+
+    def cases(self) -> list[tuple[str, tuple]]:
+        from . import pulse_memory
+
+        return [(f"{c.id}#{t}", (c, t)) for t in range(1, self.spec.p["repeats"] + 1)
+                for c in pulse_memory.load()]
+
+    def done(self) -> set[str]:
+        return {f"{r['case_id']}#{r['trial']}" for r in self.db.q(
+            "SELECT case_id, trial FROM pulse_memory_cases WHERE model_id=? AND spec_key=?"
+            " AND settings_fingerprint=?",
+            self.model.model_id, self.spec.key, self.model.settings_fingerprint)}
+
+    def body(self, case: tuple) -> dict:
+        from . import pulse_memory
+
+        return pulse_memory.body(self.model.model_id, *case)
+
+    def tally(self) -> tuple[int, int]:
+        r = self.db.q1(
+            "SELECT count(*) AS n, sum(pulse_ok) AS ok FROM pulse_memory_cases"
+            " WHERE model_id=? AND spec_key=? AND settings_fingerprint=?",
+            self.model.model_id, self.spec.key, self.model.settings_fingerprint)
+        return r["n"], r["ok"] or 0
+
+    def record(self, case: tuple, resp: httpx.Response, elapsed: float) -> None:
+        from . import pulse_memory
+
+        c, trial = case
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"error": resp.text[:2000]}
+        usage = data.get("usage") or {}
+        total = usage.get("total_time") or elapsed
+        if resp.status_code >= 400 or not data.get("choices"):
+            content = finish = parsed = None
+            pulse_ok = content_ok = False
+            reason = f"HTTP {resp.status_code}: {json.dumps(data)[:300]}"
+        else:
+            choice = data["choices"][0]
+            content = (choice.get("message") or {}).get("content")
+            finish = choice.get("finish_reason")
+            pulse_ok, content_ok, reason, parsed = pulse_memory.score(c, content, finish, total)
+        if not pulse_ok:
+            log.info("  %s#%d: %s", c.id, trial, reason)
+        self.db.x(
+            "INSERT OR REPLACE INTO pulse_memory_cases(run_id, model_id, spec_key,"
+            " settings_fingerprint, case_id, trial, pulse_ok, content_ok, reason, content,"
+            " parsed_json, finish_reason, prompt_tokens, completion_tokens, total_time, raw_json,"
+            " recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            self.run_id, self.model.model_id, self.spec.key, self.model.settings_fingerprint,
+            c.id, trial, int(pulse_ok), int(content_ok), reason, content,
+            None if parsed is None else dumps(parsed), finish, usage.get("prompt_tokens"),
+            usage.get("completion_tokens"), total, dumps(data), now(),
+        )
+
+
 class OmlxStepError(RuntimeError):
     pass
+
+
+EXECUTIONS = {"tools": ToolsExecution, "agent_turns": AgentTurnsExecution,
+              "pulse_memory": PulseMemoryExecution}

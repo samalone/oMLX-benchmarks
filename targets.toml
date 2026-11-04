@@ -49,6 +49,12 @@ exclude_models = ["Devstral-*"]
 [[benchmarks]]
 tier = 3
 tools = { categories = { simple = 40, multiple = 40, parallel = 40, parallel_multiple = 40, irrelevance = 40 }, enable_thinking = true }
+# Pulse memory: the JSON-output request Hermes's Pulse plugin makes
+# (response_format json_object, no thinking flag), 13 synthetic chats, each
+# 3 times since failures are intermittent. Added 2026-11-04 after
+# Ornith-1.5-35B-A3B-Abliterated returned wrong-shaped JSON (`[1]`, a bare
+# item) for about two Pulse calls in three.
+pulse_memory = { repeats = 3 }
 exclude_models = ["Devstral-*"]
 
 # Tier 4: capability in the mode Hermes uses (thinking on). Comparing the

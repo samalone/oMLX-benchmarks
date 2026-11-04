@@ -34,7 +34,7 @@ from .client import (NET_ERRORS, EventPump, OmlxClient, OmlxError, RejectedReque
 from .control import daemon_alive, pause_state
 from .db import DB, dumps, now
 from .importer import ImportState, import_ui
-from .planner import WorkUnit, plan
+from .planner import HARNESS_KINDS, WorkUnit, plan
 from .snapshot import State, capture_state
 from .specs import Spec, Targets, perf_spec_from_result
 
@@ -235,7 +235,7 @@ class Runner:
         """Close out runs a previous runner left 'running' (crash, reboot)."""
         for run in self.db.q("SELECT * FROM runs WHERE status = 'running' AND source = 'runner'"):
             server_status = None
-            if run["kind"] in ("tools", "agent_turns"):
+            if run["kind"] in HARNESS_KINDS:
                 # Our own requests died with the old process; nothing to cancel.
                 self.db.finish_run(run["id"], status="interrupted", error="runner exited mid-run")
                 continue
@@ -264,10 +264,10 @@ class Runner:
             model_snapshot_id=state.snapshot_ids.get(unit.model.model_id),
             environment_id=state.env_id, request=request, spec_keys=[s.key for s in unit.specs],
         )
-        if unit.kind in ("tools", "agent_turns"):
-            from .harness import AgentTurnsExecution, ToolsExecution
+        if unit.kind in HARNESS_KINDS:
+            from .harness import EXECUTIONS
 
-            cls = ToolsExecution if unit.kind == "tools" else AgentTurnsExecution
+            cls = EXECUTIONS[unit.kind]
             harness = cls(self.client, self.db, unit, state.env.hash, run_id)
             try:
                 harness.run()  # closing our connection on the way out cancels cleanly

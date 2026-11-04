@@ -347,9 +347,47 @@ CREATE TABLE agent_turns (
 # v5: databases that ran a draft of v4 got an older v_agent_turns.
 _SCHEMA_V5 = "DROP VIEW IF EXISTS v_agent_turns;\n" + _V_AGENT_TURNS
 
+_SCHEMA_V6 = """
+-- Pulse memory extraction (pulse_memory.py): one row per case x trial.
+-- pulse_ok: Hermes's Pulse plugin would accept the reply (a JSON object with
+-- an "items" list, in time); content_ok: it is also sensible for the case.
+CREATE TABLE pulse_memory_cases (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    model_id TEXT NOT NULL,
+    spec_key TEXT NOT NULL,
+    settings_fingerprint TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    trial INTEGER NOT NULL,
+    pulse_ok INTEGER NOT NULL,
+    content_ok INTEGER NOT NULL,
+    reason TEXT,
+    content TEXT,                      -- the reply text
+    parsed_json TEXT,                  -- the reply as parsed, NULL if not JSON
+    finish_reason TEXT,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    total_time REAL,                   -- seconds, from oMLX usage (client-side if absent)
+    raw_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    UNIQUE (model_id, spec_key, settings_fingerprint, case_id, trial)
+);
+
+CREATE VIEW v_pulse_memory AS
+SELECT p.model_id, p.settings_fingerprint, p.spec_key,
+       count(*) AS n, sum(p.pulse_ok) AS pulse_ok, avg(p.pulse_ok) AS pulse_ok_rate,
+       sum(p.content_ok) AS content_ok, avg(p.content_ok) AS content_ok_rate,
+       count(DISTINCT CASE WHEN p.pulse_ok = 0 THEN p.case_id END) AS cases_with_failures,
+       avg(p.completion_tokens) AS avg_completion_tokens, avg(p.total_time) AS avg_time_s,
+       max(p.total_time) AS max_time_s, max(p.recorded_at) AS recorded_at
+FROM pulse_memory_cases p
+GROUP BY p.model_id, p.settings_fingerprint, p.spec_key;
+"""
+
 # Each entry upgrades the schema by one version. Append; never edit old ones
 # (v4's view moved to _V_AGENT_TURNS, applied by v5 for every database).
-MIGRATIONS: list[str] = [_SCHEMA_V1, _SCHEMA_V2, _SCHEMA_V3, _SCHEMA_V4, _SCHEMA_V5]
+MIGRATIONS: list[str] = [_SCHEMA_V1, _SCHEMA_V2, _SCHEMA_V3, _SCHEMA_V4, _SCHEMA_V5,
+                         _SCHEMA_V6]
 
 
 class DB:

@@ -49,6 +49,7 @@ For anything the digest doesn't answer, query the database directly:
 | `v_context` | Largest prompt the machine could actually prefill, per model. |
 | `v_agent_turns`, `agent_turns` | **The best guide to how Hermes feels.** A fixed Hermes-shaped session replayed per model: a ~20k-token system prompt with 40 tools, then tool results growing it to ~64k, with prefix caching. Gives cold time to first token (session start), warm TTFT per agent step, the cache hit rate, and decode speed at ~64k. One row per complete replay. |
 | `v_tools`, `tool_cases` | Tool calling (BFCL v3, run by omlxbench through the chat API, thinking on): accuracy per category, and each case with the parsed calls, the reason for a failure, and the raw response. |
+| `v_pulse_memory`, `pulse_memory_cases` | Structured JSON output as Hermes's Pulse plugin requests it (`response_format: json_object`, a long extraction prompt, synthetic chats, each case repeated). `pulse_ok`: Pulse would accept the reply (a JSON object with an `items` list, not truncated, under 120 s); `content_ok`: the items also fit the chat (loose). `reason` says what was wrong, `content` is the raw reply. |
 | `accuracy_questions` | Per-question results: expected, predicted, raw response, tokens, time. |
 | `model_snapshots` | Model metadata: architecture (`arch`), `quant_bits`, `size_bytes`, `native_context`, full `settings_json` and `config_json`. |
 | `environments` | Hardware, macOS, oMLX and mlx-lm versions, perf-relevant global settings. |
