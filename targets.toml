@@ -16,7 +16,16 @@ quiet_minutes = 10        # no API traffic for this long before a run starts
 [models]
 include = ["*"]           # glob patterns against oMLX model ids
 # clef-flash is not a chat model: it can't be driven through the chat API.
-exclude = ["clef-flash-*"]
+# The GGUF models go to Splash, which (since 2026-10-30) serves only the
+# Qwen3.8-27B, Qwen3.6-35B-A3B and Qwen3.8-Flash-Next families, so these
+# four fail to load (HTTP 409). Their earlier results are kept.
+exclude = [
+    "clef-flash-*",
+    "Jan-v1-4B-Q4_K_M",
+    "medgemma-1.5-4b-it-Q4_K_S",
+    "Qwen3-30B-A3B-abliterated-erotic.i1-Q4_K_S",
+    "nicoboss.Qwen3-32B-Uncensored.Q4_K_S",
+]
 types = ["llm", "vlm"]
 
 # Tier 1 (done for all models): the oMLX web UI defaults, a quick speed
