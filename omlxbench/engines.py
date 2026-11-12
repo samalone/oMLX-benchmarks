@@ -151,6 +151,21 @@ class TensorFoldClient:
         self._connect(f"http://{host}:{port}")
         return True
 
+    def _reload_key(self) -> bool:
+        """Re-read TENSORFOLD_API_KEY (the user updates .env after the app
+        issued a new one). True if it changed."""
+        from .config import load_config
+
+        try:
+            key = load_config().tensorfold_api_key
+        except SystemExit:
+            return False
+        if not key or key == self.api_key:
+            return False
+        self.api_key = key
+        self.http.headers["Authorization"] = f"Bearer {key}"
+        return True
+
     def close(self) -> None:
         if self.http is not None:
             self.http.close()
@@ -171,6 +186,8 @@ class TensorFoldClient:
             # /health needs no key; check ours. The app issues a new key when
             # it restarts the server, so a stale .env shows up here.
             auth = self.http.get("/v1/models")
+            if auth.status_code in (401, 403) and self._reload_key():
+                auth = self.http.get("/v1/models")
             if auth.status_code in (401, 403):
                 return {"http_status": auth.status_code,
                         "status": "API key rejected: update TENSORFOLD_API_KEY in .env "
