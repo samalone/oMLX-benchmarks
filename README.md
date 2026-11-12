@@ -27,12 +27,25 @@ database. There is no UI.
 | `context` | oMLX built-in | The largest prompt the machine can actually prefill. |
 | `accuracy` | oMLX built-in | mmlu, mmlu_pro, gsm8k, humaneval, mbpp, livecodebench and others, with thinking on or off. |
 | `tools` | omlxbench | Tool calling: [BFCL v3](https://gorilla.cs.berkeley.edu/leaderboard.html) cases sent through oMLX's chat API with real `tools`, so the model's chat template and oMLX's tool-call parser are tested together, scored like BFCL. |
+| `stream_perf` | omlxbench | Client-side speed: one streamed request per prompt length, timed by omlxbench, so it measures any engine the same way. |
 | `agent_turns` | omlxbench | A replay of a fixed agent session: a ~20k-token system prompt with 40 tools, then tool results growing it to ~64k tokens, prefix-cached. It records time to first token at every step, which is the closest single number to how an agent like [Hermes](https://github.com/NousResearch/hermes-agent) feels. |
 
 Each result is stored against a snapshot of the model (quantization, context
 length, the acceleration features enabled) and of the environment (chip, RAM,
 macOS, oMLX and mlx-lm versions, perf-relevant server settings). Changing a
 model's settings therefore creates new gaps without discarding old data.
+
+### A second engine: TensorFold
+
+omlxbench can also measure [TensorFold](https://tensorfold.dev), to compare
+engines on the models both can run. Add `TENSORFOLD_API_KEY=...` to `.env`
+(the port is found from the running `tensorfold-native serve` process; set
+`TENSORFOLD_URL` to fix it instead) and add `engines = ["tensorfold"]` to a
+`[[benchmarks]]` block. Only one engine should run at a time: the runner uses
+whichever is up and waits while both are. TensorFold has no benchmark API, so
+it runs only omlxbench's own suites (`tools`, `agent_turns`, `pulse_memory`,
+`stream_perf`). It serves one model at a time, so `omlxbench status` lists
+the models it still needs, and you switch models in its app.
 
 ## Requirements
 

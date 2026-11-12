@@ -1,9 +1,16 @@
 # What omlxbench should measure. Edit freely: adding a test or model creates
 # new work; removing one only stops future runs (stored results are kept).
 #
-# Each [[benchmarks]] block may hold `perf`, `accuracy`, `context` and/or `tools`
-# tables, and optionally `models` / `exclude_models` globs that narrow it.
-# Lower tiers are completed for every model before any higher tier starts.
+# Each [[benchmarks]] block may hold `perf`, `accuracy`, `context`, `tools`,
+# `agent_turns`, `pulse_memory` and/or `stream_perf` tables, and optionally
+# `models` / `exclude_models` globs that narrow it. Lower tiers are completed
+# for every model before any higher tier starts.
+#
+# `engines` (default ["omlx"]) says which inference engines a block runs on:
+# "omlx" and/or "tensorfold". Only one engine runs at a time; the runner plans
+# for whichever is up. perf, accuracy and context use oMLX's built-in
+# benchmarks, so they are oMLX-only; the rest run through the chat API on any
+# engine.
 #
 # Priorities follow how the models are used: mainly with Hermes Agent, which
 # needs >= 64k context and tool calling, runs with thinking on
@@ -79,3 +86,27 @@ exclude_models = ["Devstral-*"]
 # tier = 6
 # accuracy = { suites = { livecodebench = 100 }, enable_thinking = true }
 # models = ["..."]
+
+# Engine comparison (2026-11-12): TensorFold against oMLX on the two models
+# both can run. TensorFold serves one model at a time (switch it in its app);
+# `omlxbench status` says which model it still needs.
+#
+# stream_perf is a client-side speed test (streamed request, nothing cached,
+# thinking off, timed by omlxbench), run on both engines so speed is measured
+# the same way on each. oMLX's own perf numbers above are not comparable with it.
+[[benchmarks]]
+tier = 2
+engines = ["omlx", "tensorfold"]
+models = ["NVIDIA-Nemotron-3.5-Bolt-E4B-OptiQ-4bit", "Huihui-gemma-4-26B-A4B-it-abliterated-mlx-4bit"]
+stream_perf = { prompt_lengths = [1024, 4096, 16384, 32768, 65536] }
+
+# The chat-API suites oMLX already has results for, with the same parameters
+# so the results compare one to one. TensorFold is sent each model's oMLX
+# sampling settings explicitly.
+[[benchmarks]]
+tier = 3
+engines = ["tensorfold"]
+models = ["NVIDIA-Nemotron-3.5-Bolt-E4B-OptiQ-4bit", "Huihui-gemma-4-26B-A4B-it-abliterated-mlx-4bit"]
+agent_turns = { enable_thinking = true }
+tools = { categories = { simple = 40, multiple = 40, parallel = 40, parallel_multiple = 40, irrelevance = 40 }, enable_thinking = true }
+pulse_memory = { repeats = 3 }

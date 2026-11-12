@@ -2,7 +2,31 @@
 
 This project records benchmark results from a local [oMLX](https://omlx.ai) server
 (an MLX inference server for Apple Silicon) so they can be used to compare models
-and make recommendations for this specific machine and its owner.
+and make recommendations for this specific machine and its owner. Since 2026-11-12
+it also measures [TensorFold](https://tensorfold.dev), a second engine, so engines can
+be compared on the models both can run.
+
+## Engines
+
+Every result records its `engine`: `omlx` or `tensorfold`. Only one engine runs at a
+time (a fair comparison needs the machine to itself). Each loop the runner uses
+whichever is up, and waits if both are.
+
+- **oMLX** runs everything.
+- **TensorFold** has no benchmark or admin API, only the OpenAI chat API, `/health` and
+  Prometheus `/metrics`. So it runs only the suites omlxbench drives itself: `tools`,
+  `agent_turns`, `pulse_memory` and `stream_perf`. Its app serves **one model at a time**
+  (a `tensorfold-native serve <model dir>` process). The runner benchmarks the served model
+  if a target wants it. `omlxbench status` lists the models still missing TensorFold
+  results, so the user can switch to one of them in the app. A switch mid-run cancels the
+  run (`cancel_reason = 'model_switched'`).
+  TensorFold model ids come from the served directory's name, which matches oMLX's ids.
+  `TENSORFOLD_API_KEY` in `.env` enables it. The port is found from the serve process
+  unless `TENSORFOLD_URL` is set.
+- On engines other than oMLX, each model's saved oMLX sampling settings (`temperature`,
+  `top_p`, `top_k`, `min_p`) are sent explicitly, so both engines sample the same way.
+  They're recorded in `runs.request_json` under `sampling`.
+- `[[benchmarks]]` blocks in `targets.toml` take `engines = [...]` (default `["omlx"]`).
 
 ## Quick start
 
@@ -12,7 +36,8 @@ uv run omlxbench report          # same, as markdown tables
 uv run omlxbench html            # sortable HTML tables for people (data/reports/)
                                  # the runner serves it live, auto-refreshing: http://127.0.0.1:8765/
 uv run omlxbench status          # is the runner up, what is it doing, what's missing
-uv run omlxbench plan            # every run still needed to satisfy targets.toml
+uv run omlxbench plan            # every run still needed on the engine that is up
+                                 # (--engine tensorfold: what it needs, even while down)
 ```
 
 Each digest entry has `installed`: false once the model's weights are gone from disk.
@@ -43,7 +68,7 @@ For anything the digest doesn't answer, query the database directly:
 
 | Table / view | What it holds |
 |---|---|
-| `v_latest_perf` | Newest speed result per model × test × settings fingerprint. **Use this for comparisons.** |
+| `v_latest_perf` | Newest speed result per model × engine × test × settings fingerprint. **Use this for comparisons.** |
 | `v_perf` | Every speed result ever recorded (history, repeats). |
 | `v_latest_accuracy`, `v_accuracy` | Same for intelligence (accuracy) suites. |
 | `v_context` | Largest prompt the machine could actually prefill, per model. |
@@ -57,7 +82,11 @@ For anything the digest doesn't answer, query the database directly:
 | `usage_snapshots` | Daily copies of oMLX's 30-day usage history: which models the user actually uses, with token counts and cache hit rates. |
 | `spec_status` | Planner bookkeeping: which tests are done or have been given up on. |
 
-Every result table has `raw_json`, the verbatim oMLX object. Fields without a
+Every view has an `engine` column (and `engine_version` where an environment is
+joined). "Latest" means newest per engine too, so an oMLX and a TensorFold result for
+the same test appear side by side.
+
+Every result table has `raw_json`, the verbatim server object. Fields without a
 column (for example `system_metrics`: CPU/GPU utilization, thermal state, memory
 footprint) are reachable with `json_extract(raw_json, '$.system_metrics.gpu.util_avg')`.
 
@@ -70,6 +99,14 @@ footprint) are reachable with `json_extract(raw_json, '$.system_metrics.gpu.util
   - `e2e_latency_s`: total time for the request.
   - `peak_memory_bytes`: MLX peak memory.
   - Prompt length is `pp`; generation length is `tg`, always 128.
+- **Streamed tests** (`test_type = 'stream'`, spec kind `stream_perf`): omlxbench's
+  own client-side speed test. It sends one streamed chat request per prompt length,
+  with nothing cached, thinking off, and `tg` = 128. Times are taken on the client:
+  `ttft_ms`, `processing_tps` = prompt tokens / TTFT, and `gen_tps` = (completion − 1) /
+  (last token − first token). `pp` is the target length; `prompt_tokens` is the real one.
+  `peak_memory_bytes` is only filled on TensorFold. This is the one speed test that
+  measures every engine the same way. **Compare engines with it, not with `single` rows**,
+  which come from oMLX's in-server benchmark.
 - **Batch tests** (`test_type = 'batch'`):
   - `batch_size` concurrent requests at pp1024.
   - `gen_tps` and `processing_tps` are *aggregate* throughput across all requests.
@@ -91,7 +128,10 @@ footprint) are reachable with `json_extract(raw_json, '$.system_metrics.gpu.util
 `settings_fingerprint` lists the active acceleration features. Possible values include
 `baseline`, `turboquant_kv_4bit` and `dflash,lightning_mtp`. Results with different
 fingerprints are different configurations of the same model; compare like with like,
-or treat each fingerprint as a separate option. Full settings are in
+or treat each fingerprint as a separate option. The same goes for `engine`. On
+TensorFold the fingerprint holds non-default speed options of the serve command
+(`no_drafts`, `speed_up_<x>`, …); `baseline` means the app's defaults, which include
+speculative (MTP) drafts. Full settings are in
 `model_snapshots.settings_json`.
 
 ## Caveats when drawing conclusions
