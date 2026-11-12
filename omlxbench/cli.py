@@ -14,10 +14,10 @@ from pathlib import Path
 from .client import NET_ERRORS, OmlxClient
 from .config import load_config
 from .db import DB
-from .planner import iter_targets, plan, spec_state
+from .planner import HARNESS_KINDS, iter_targets, missing_by_model, plan, spec_state
 from .control import clear_pause, daemon_alive, pause_state, set_pause
-from .runner import Runner, cancel_orphan
-from .snapshot import capture_environment, snapshot_model
+from .runner import Runner, cancel_orphan, engine_up
+from .snapshot import capture_state
 from .specs import load_targets
 
 
@@ -38,26 +38,48 @@ class App:
     def __init__(self):
         self.cfg = load_config()
         self.db = DB(self.cfg.db_path)
-        self.client = OmlxClient(self.cfg.base_url, self.cfg.api_key)
+        self.clients: dict = {}
+        if self.cfg.api_key:
+            self.clients["omlx"] = OmlxClient(self.cfg.base_url, self.cfg.api_key)
+        if self.cfg.tensorfold_api_key:
+            from .engines import TensorFoldClient
+
+            self.clients["tensorfold"] = TensorFoldClient(self.cfg.tensorfold_url,
+                                                          self.cfg.tensorfold_api_key)
+        self.client = self.clients.get("omlx")
 
     def targets(self):
         return load_targets(self.cfg.targets_path)
 
-    def current_plan(self):
-        env = capture_environment(self.client)
-        models = [snapshot_model(e) for e in self.client.admin_models()]
-        return env, models, plan(self.db, self.targets(), models, env.hash)
+    def active_engine(self) -> str | None:
+        """The engine that is up (the first, if several are)."""
+        return next((name for name, c in self.clients.items() if engine_up(c)), None)
+
+    def current_plan(self, engine: str):
+        """(state, units) for `engine`, which must be up. Snapshots are recorded."""
+        state = capture_state(self.clients[engine], self.db)
+        return state, plan(self.db, self.targets(), state.models, state.env.hash, engine)
 
     # -- commands -----------------------------------------------------------
 
     def cmd_status(self, args) -> None:
-        try:
-            st = self.client.status()
-            print(f"server:  oMLX {st.get('version')}, {st.get('models_discovered')} models, "
-                  f"loaded: {', '.join(st.get('loaded_models') or []) or 'none'}")
-        except NET_ERRORS as e:
-            print(f"server:  unreachable ({e})")
-            st = None
+        up = []
+        for name, c in self.clients.items():
+            if not engine_up(c):
+                print(f"{name + ':':<11}down")
+                continue
+            up.append(name)
+            try:
+                st = c.status()
+            except NET_ERRORS as e:
+                print(f"{name + ':':<11}unreachable ({e})")
+                continue
+            loaded = ", ".join(st.get("loaded_models") or []) or "none"
+            if name == "omlx":
+                print(f"{'omlx:':<11}oMLX {st.get('version')}, {st.get('models_discovered')} "
+                      f"models, loaded: {loaded}")
+            else:
+                print(f"{name + ':':<11}up at {c.base_url}, serving {loaded}")
         pid = daemon_alive(self.db)
         beat = self.db.get_control("daemon_heartbeat")
         print(f"runner:  {'running (pid %d, last check %s)' % (pid, beat) if pid else 'not running'}")
@@ -71,42 +93,85 @@ class App:
             print(f"current: run {run['id']} {run['kind']} {run['model_id']} since "
                   f"{run['started_at']}: {msg}")
 
-        if st is not None:
-            env, models, units = self.current_plan()
+        if len(up) > 1:
+            print(f"engines: {' and '.join(up)} are both up; the runner waits until only one is")
+        for name in up:
+            try:
+                state, units = self.current_plan(name)
+            except NET_ERRORS as e:
+                print(f"missing: ({name} unreachable: {e})")
+                continue
             n_specs = sum(len(u.specs) for u in units)
-            print(f"missing: {n_specs} results in {len(units)} runs"
+            print(f"missing: {n_specs} results in {len(units)} runs on {name}"
                   + (f"; next: {units[0].describe()}" if units else ""))
+        for name in self.clients:
+            if name == "omlx":
+                continue
+            # One model at a time: say which models still need this engine.
+            served = set()
+            if name in up:
+                served = {m.model_id for m in capture_state(self.clients[name], self.db).models}
+            others = {m: n for m, n in missing_by_model(self.db, self.targets(), name).items()
+                      if m not in served}
+            if others:
+                print(f"{name} still needs: " + ", ".join(f"{m} ({n} results)"
+                                                         for m, n in others.items())
+                      + " (switch models in its app)")
 
         print("\nrecent runs:")
         for r in self.db.q("SELECT r.*, (SELECT count(*) FROM perf_results WHERE run_id=r.id)"
                            " + (SELECT count(*) FROM accuracy_results WHERE run_id=r.id)"
-                           " + (SELECT count(*) FROM context_results WHERE run_id=r.id) AS n"
+                           " + (SELECT count(*) FROM context_results WHERE run_id=r.id)"
+                           " + (SELECT count(*) FROM tool_cases WHERE run_id=r.id)"
+                           " + (SELECT count(*) FROM agent_turns WHERE run_id=r.id)"
+                           " + (SELECT count(*) FROM pulse_memory_cases WHERE run_id=r.id) AS n"
                            " FROM runs r ORDER BY id DESC LIMIT ?", args.recent):
             reason = f" ({r['cancel_reason']})" if r["cancel_reason"] else ""
-            print(f"  #{r['id']:<4} {r['started_at']}  {r['kind']:<8} {r['status']}{reason:<15} "
-                  f"{r['n']} results  {r['model_id']}")
+            print(f"  #{r['id']:<4} {r['started_at']}  {r['engine']:<10} {r['kind']:<12} "
+                  f"{r['status']}{reason:<15} {r['n']} results  {r['model_id']}")
 
     def cmd_plan(self, args) -> None:
-        env, models, units = self.current_plan()
+        engine = args.engine or self.active_engine()
+        if engine is None:
+            raise SystemExit("no engine is up; use --engine to see what one still needs")
+        if engine not in self.clients:
+            raise SystemExit(f"{engine} is not configured (no API key)")
+        if not engine_up(self.clients[engine]):
+            others = missing_by_model(self.db, self.targets(), engine)
+            print(f"{engine} is down; results still missing on it, by model:")
+            for m, n in others.items():
+                print(f"  {m}: {n}")
+            return
+        state, units = self.current_plan(engine)
+        print(f"engine: {engine}")
         if not units:
             print("nothing missing")
         for i, u in enumerate(units, 1):
             print(f"{i:3}. {u.describe()}")
+        if engine != "omlx":
+            served = {m.model_id for m in state.models}
+            others = {m: n for m, n in missing_by_model(self.db, self.targets(), engine).items()
+                      if m not in served}
+            if others:
+                print(f"\nnot being served, still missing on {engine}:")
+                for m, n in others.items():
+                    print(f"  {m}: {n}")
         if args.failed:
             targets = self.targets()
             print("\nfailed (skipped until environment or settings change):")
-            for _, m, s in iter_targets(targets, models):
-                if spec_state(self.db, m.model_id, s, m.settings_fingerprint, env.hash) == "failed":
+            for _, m, s in iter_targets(targets, state.models, engine):
+                if spec_state(self.db, m.model_id, s, m.settings_fingerprint, state.env.hash,
+                              engine) == "failed":
                     print(f"  {m.model_id}: {s.label()}")
 
     def cmd_run(self, args) -> None:
         if args.dry_run:
-            return self.cmd_plan(argparse.Namespace(failed=False))
+            return self.cmd_plan(argparse.Namespace(failed=False, engine=None))
         if self.cfg.http_addr:
             from .web import parse_addr, serve_in_background
 
             serve_in_background(self.cfg.db_path, parse_addr(self.cfg.http_addr))
-        Runner(self.client, self.db, self.targets, args.quiet_minutes).loop(once=args.once)
+        Runner(self.clients, self.db, self.targets, args.quiet_minutes).loop(once=args.once)
 
     def cmd_pause(self, args) -> None:
         until = None
@@ -121,6 +186,10 @@ class App:
             return
         running = self.db.q("SELECT * FROM runs WHERE status='running' AND source='runner'")
         for run in running:
+            if run["kind"] in HARNESS_KINDS or self.client is None:
+                # omlxbench's own requests: nothing server-side to cancel.
+                self.db.finish_run(run["id"], status="cancelled", cancel_reason="paused")
+                continue
             try:
                 cancel_orphan(self.client, run["kind"], run["omlx_bench_id"], run["model_id"])
                 print(f"cancelled run {run['id']} ({run['kind']} on {run['model_id']})")
@@ -171,37 +240,42 @@ class App:
         print(f"imported {n} runs")
 
     def cmd_requeue(self, args) -> None:
-        rows = self.db.q("SELECT s.*, e.omlx_version FROM spec_status s"
+        rows = self.db.q("SELECT s.*, e.engine_version FROM spec_status s"
                          " LEFT JOIN runs r ON r.id = s.last_run_id"
                          " LEFT JOIN environments e ON e.id = r.environment_id")
         cutoff = _version_tuple(args.before_version) if args.before_version else None
         chosen = [
             r for r in rows
             if fnmatch.fnmatchcase(r["model_id"], args.model)
+            and fnmatch.fnmatchcase(r["engine"], args.engine)
             and fnmatch.fnmatchcase(r["spec_key"], args.spec)
             and (not args.failed or r["state"] == "failed")
-            and (cutoff is None or _version_tuple(r["omlx_version"]) < cutoff)
+            and (cutoff is None or _version_tuple(r["engine_version"]) < cutoff)
         ]
         for r in chosen:
-            print(f"  {r['state']:<6} {r['model_id']}  {r['spec_key']}")
+            print(f"  {r['state']:<6} {r['engine']:<10} {r['model_id']}  {r['spec_key']}")
         if not args.yes:
             print(f"{len(chosen)} entries would be re-queued; add --yes to do it "
                   "(stored results are kept either way)")
             return
         with self.db.tx():
             for r in chosen:
-                self.db.x("DELETE FROM spec_status WHERE model_id=? AND spec_key=?"
+                self.db.x("DELETE FROM spec_status WHERE model_id=? AND engine=? AND spec_key=?"
                           " AND settings_fingerprint=?",
-                          r["model_id"], r["spec_key"], r["settings_fingerprint"])
+                          r["model_id"], r["engine"], r["spec_key"], r["settings_fingerprint"])
         print(f"re-queued {len(chosen)}")
 
     def cmd_snapshot(self, args) -> None:
-        env = capture_environment(self.client)
-        print(f"environment {env.hash}: oMLX {env.omlx_version}, {env.chip} {env.chip_variant}, "
-              f"{env.memory_gb} GB, {env.gpu_cores} GPU cores, macOS {env.macos_version}")
+        engine = self.active_engine()
+        if engine is None:
+            raise SystemExit("no engine is up")
+        state = capture_state(self.clients[engine], self.db)
+        env = state.env
+        print(f"environment {env.hash}: {engine} {env.engine_version}, {env.chip} "
+              f"{env.chip_variant}, {env.memory_gb} GB, {env.gpu_cores} GPU cores, "
+              f"macOS {env.macos_version}")
         targets = self.targets()
-        for e in self.client.admin_models():
-            m = snapshot_model(e)
+        for m in state.models:
             wanted = "*" if targets.wants_model(m.admin_model) else " "
             bits = f"{m.quant_bits:g}bit" if m.quant_bits else "?bit"
             print(f" {wanted} {m.model_id:<70} {m.model_type or '?':<4} {m.arch or '?':<14} "
@@ -219,6 +293,8 @@ def main(argv: list[str] | None = None) -> None:
 
     p = sub.add_parser("plan", help="list the runs needed to fill in missing results")
     p.add_argument("--failed", action="store_true", help="also list specs given up on")
+    p.add_argument("--engine", choices=["omlx", "tensorfold"],
+                   help="engine to plan for (default: the one that is up)")
 
     p = sub.add_parser("run", help="run the background loop")
     p.add_argument("--once", action="store_true", help="run at most one unit, then exit")
@@ -250,9 +326,10 @@ def main(argv: list[str] | None = None) -> None:
 
     p = sub.add_parser("requeue", help="forget results so they are measured again")
     p.add_argument("--model", default="*", help="model id glob")
+    p.add_argument("--engine", default="*", help="engine glob (omlx, tensorfold)")
     p.add_argument("--spec", default="*", help="spec key glob, e.g. 'perf.single:*' or '*mmlu*'")
     p.add_argument("--failed", action="store_true", help="only specs that were given up on")
-    p.add_argument("--before-version", help="only results measured on an older oMLX")
+    p.add_argument("--before-version", help="only results measured on an older engine version")
     p.add_argument("--yes", action="store_true")
 
     sub.add_parser("snapshot", help="show the environment and models as recorded")
@@ -265,4 +342,4 @@ def main(argv: list[str] | None = None) -> None:
     try:
         getattr(app, "cmd_" + args.cmd.replace("-", "_"))(args)
     except NET_ERRORS as e:
-        raise SystemExit(f"oMLX error: {e}")
+        raise SystemExit(f"server error: {e}")

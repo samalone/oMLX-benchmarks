@@ -33,6 +33,8 @@ class Config:
     db_path: Path
     targets_path: Path
     http_addr: str  # where the runner serves the HTML report; empty = off
+    tensorfold_url: str = ""      # empty = discover from the serve process
+    tensorfold_api_key: str = ""  # empty = TensorFold not used
 
 
 def load_config() -> Config:
@@ -42,12 +44,17 @@ def load_config() -> Config:
         return os.environ.get(name) or dotenv.get(name) or default
 
     api_key = get("OMLX_API_KEY")
-    if not api_key:
-        raise SystemExit("OMLX_API_KEY is not set (environment or .env)")
+    tf_key = get("TENSORFOLD_API_KEY")
+    if not api_key and not tf_key:
+        raise SystemExit("neither OMLX_API_KEY nor TENSORFOLD_API_KEY is set (environment or .env)")
     return Config(
         base_url=get("OMLX_URL", "http://127.0.0.1:8000").rstrip("/"),
         api_key=api_key,
         db_path=Path(get("OMLXBENCH_DB", str(PROJECT_ROOT / "data" / "omlxbench.sqlite3"))),
         targets_path=Path(get("OMLXBENCH_TARGETS", str(PROJECT_ROOT / "targets.toml"))),
         http_addr="" if get("OMLXBENCH_HTTP").lower() == "off" else get("OMLXBENCH_HTTP", "127.0.0.1:8765"),
+        # Empty = find the port from the running `tensorfold-native serve`
+        # process (the app may pick a new one each time it starts).
+        tensorfold_url=get("TENSORFOLD_URL").rstrip("/"),
+        tensorfold_api_key=tf_key,
     )

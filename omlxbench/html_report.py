@@ -29,26 +29,36 @@ def _k(n: int) -> str:
     return f"{n // 1024}k" if n >= 1024 and n % 1024 == 0 else str(n)
 
 
+_SECTIONS = ("perf", "accuracy", "tools", "agent_turns", "pulse_memory", "context")
+ENGINE_NAMES = {"omlx": "oMLX", "tensorfold": "TensorFold"}
+
+
 def _rows(d: dict) -> list[dict]:
-    """One row per model × settings fingerprint, with that fingerprint's results."""
+    """One row per model × engine × settings fingerprint, with its results."""
     rows = []
     for m in d["models"]:
-        fps = []
-        for section in ("perf", "accuracy", "tools", "agent_turns", "pulse_memory", "context"):
+        keys = []
+        for section in _SECTIONS:
             for r in m[section]:
-                if r["settings"] not in fps:
-                    fps.append(r["settings"])
-        for fp in fps:
+                k = (r.get("engine", "omlx"), r["settings"])
+                if k not in keys:
+                    keys.append(k)
+        keys.sort(key=lambda k: (k[0] != "omlx", k[0]))  # oMLX first, order kept within
+        for engine, fp in keys:
             rows.append({
-                "model": m, "settings": fp,
-                **{s: [r for r in m[s] if r["settings"] == fp]
-                   for s in ("perf", "accuracy", "tools", "agent_turns", "pulse_memory", "context")},
+                "model": m, "engine": engine, "settings": fp,
+                **{s: [r for r in m[s] if r["settings"] == fp
+                       and r.get("engine", "omlx") == engine] for s in _SECTIONS},
             })
     return rows
 
 
 def _single(r: dict, pp: int) -> dict | None:
     return next((p for p in r["perf"] if p["test"] == "single" and p["pp"] == pp), None)
+
+
+def _stream(r: dict, pp: int) -> dict | None:
+    return next((p for p in r["perf"] if p["test"] == "stream" and p["pp"] == pp), None)
 
 
 def _test(r: dict, test: str) -> dict | None:
@@ -88,8 +98,9 @@ def _get(p: dict | None, key: str, scale: float = 1) -> Cell:
 def _tables(d: dict) -> list[tuple[str, str, list[Col], list[tuple[dict, list[Cell]]]]]:
     rows = _rows(d)
     pps = sorted({p["pp"] for r in rows for p in r["perf"] if p["test"] == "single"})
-    batches = sorted({p["test"] for r in rows for p in r["perf"] if p["test"] != "single"},
-                     key=lambda t: int(t[5:]))
+    batches = sorted({p["test"] for r in rows for p in r["perf"]
+                      if p["test"].startswith("batch")}, key=lambda t: int(t[5:]))
+    stream_pps = sorted({p["pp"] for r in rows for p in r["perf"] if p["test"] == "stream"})
     suites = sorted({a["suite"] for r in rows for a in r["accuracy"]})
     cats = sorted({t["category"] for r in rows for t in r["tools"]})
     tables = []
@@ -140,8 +151,66 @@ def _tables(d: dict) -> list[tuple[str, str, list[Col], list[tuple[dict, list[Ce
                   _rate(first(r["pulse_memory"]), "pulse_ok")]
         cells += [_pct(suite(r, s)) for s in suites]
         body.append((r, cells))
-    tables.append(("Overview", "One row per model and acceleration settings. "
+    tables.append(("Overview", "One row per model, engine and acceleration settings. "
                    "Hover a header for what it measures.", cols, body))
+
+    engines_of: dict[str, set] = {}
+    for r in rows:
+        engines_of.setdefault(r["model"]["model_id"], set()).add(r["engine"])
+    multi = {m for m, es in engines_of.items() if len(es) > 1}
+    if multi:
+        s_decode = 4096 if 4096 in stream_pps else first(stream_pps)
+        s_long = max((p for p in stream_pps if p <= 32768), default=None)
+        cols = []
+        if s_decode:
+            cols.append(Col(f"Decode tok/s @{_k(s_decode)}", HIGH, 1,
+                            title="Streamed test, timed by omlxbench (same on every engine)"))
+        if s_long:
+            cols += [Col(f"Decode tok/s @{_k(s_long)}", HIGH, 1),
+                     Col(f"Prefill tok/s @{_k(s_long)}", HIGH, 0),
+                     Col(f"TTFT s @{_k(s_long)}", LOW, 1, title="Nothing cached")]
+        cols += [Col("Warm step s", LOW, 1, title="Agent session: mean time to first token per "
+                     "step after the first, with prefix caching"),
+                 Col("Cold start s", LOW, 1, title="Agent session: ~20k-token first prompt"),
+                 Col("Tool calls", HIGH, 1, "%", title="BFCL v3, all categories pooled"),
+                 Col("Pulse memory", HIGH, 0, "%")]
+        body = []
+        for r in rows:
+            if r["model"]["model_id"] not in multi:
+                continue
+            at = first(r["agent_turns"])
+            cells = []
+            if s_decode:
+                cells.append(_get(_stream(r, s_decode), "tg_tps"))
+            if s_long:
+                p = _stream(r, s_long)
+                cells += [_get(p, "tg_tps"), _get(p, "pp_tps"), _get(p, "ttft_ms", 1 / 1000)]
+            cells += [_get(at, "warm_ttft_s"), _get(at, "cold_ttft_s"), _tools_overall(r),
+                      _rate(first(r["pulse_memory"]), "pulse_ok")]
+            body.append((r, cells))
+        body.sort(key=lambda rc: rc[0]["model"]["model_id"])
+        tables.append(("Engine comparison", "Models measured on more than one engine, one row "
+                       "per engine. Speed columns come from the streamed test, which every "
+                       "engine runs the same way; each engine runs with its own defaults "
+                       "(TensorFold's include speculative drafts) and the same sampling.",
+                       cols, body))
+
+    if stream_pps:
+        cols = []
+        for pp in stream_pps:
+            cols += [Col(f"Decode @{_k(pp)}", HIGH, 1, title="tokens/s"),
+                     Col(f"Prefill @{_k(pp)}", HIGH, 0, title="tokens/s"),
+                     Col(f"TTFT s @{_k(pp)}", LOW, 1)]
+        body = []
+        for r in rows:
+            cells = []
+            for pp in stream_pps:
+                p = _stream(r, pp)
+                cells += [_get(p, "tg_tps"), _get(p, "pp_tps"), _get(p, "ttft_ms", 1 / 1000)]
+            body.append((r, cells))
+        tables.append(("Streamed speed", "One streamed request per prompt length, nothing "
+                       "cached, timed by omlxbench from the client: comparable across engines, "
+                       "not with oMLX's own figures below.", cols, body))
 
     cols = [Col("Cold TTFT s", LOW, 1, title="Session start: first prompt, nothing cached"),
             Col("Cold prefill tok/s", HIGH, 0),
@@ -260,11 +329,16 @@ def _table_html(cols: list[Col], body: list[tuple[dict, list[Cell]]]) -> str:
     for r, cells in body:
         m = r["model"]
         tag = "" if r["settings"] == "baseline" else f' <span class=fp>{escape(r["settings"])}</span>'
+        engine = r.get("engine", "omlx")
+        if engine != "omlx":
+            tag = (f' <span class=engine>{escape(ENGINE_NAMES.get(engine, engine))}</span>'
+                   + tag)
         gone = not m.get("installed", True)
         if gone:
             tag += " <span class=gone-tag>removed</span>"
         out.append(f'<tr{" class=gone" if gone else ""}><td class=model '
-                   f'data-v="{escape(m["model_id"])}">{escape(m["model_id"])}{tag}</td>')
+                   f'data-v="{escape(m["model_id"])} {escape(engine)}">'
+                   f'{escape(m["model_id"])}{tag}</td>')
         for col, c in zip(cols, cells):
             if c.value is None:
                 out.append("<td class=na>—</td>")
@@ -280,8 +354,10 @@ def render(d: dict, generated: datetime, version: str | None = None) -> str:
     """With a `version`, the page is served live: it polls /version and reloads
     itself when the results change, keeping its sort order, toggle and scroll."""
     hw = d.get("hardware")
+    engines = " · ".join(f"{ENGINE_NAMES.get(e, e)} {escape(str(v))}" for e, v in
+                         ((hw or {}).get("engines") or {"omlx": (hw or {}).get("omlx")}).items())
     sub = (f"{escape(hw['chip'])}, {hw['memory_gb']} GB, {hw['gpu_cores']} GPU cores · "
-           f"macOS {escape(hw['macos'])} · oMLX {escape(hw['omlx'])}" if hw else "")
+           f"macOS {escape(hw['macos'])} · {engines}" if hw else "")
     sections = []
     for title, note, cols, body in _tables(d):
         sections.append(f"<section><h2>{escape(title)}</h2><p class=note>{escape(note)}</p>"
@@ -303,11 +379,13 @@ _PAGE = """<!doctype html>
 :root {{
   --bg: #fbfbfa; --fg: #1d1d1f; --muted: #6e6e73; --line: #e3e3e0; --head: #f2f2ef;
   --best-bg: #d9f2df; --best-fg: #0f5c25; --hover: #f0f4fa; --tag: #e8e3f7; --tag-fg: #4b3a8c;
+  --eng: #fdecd2; --eng-fg: #7a4a00;
 }}
 @media (prefers-color-scheme: dark) {{
   :root {{
     --bg: #161618; --fg: #ececee; --muted: #9a9aa0; --line: #2e2e33; --head: #202024;
     --best-bg: #17432a; --best-fg: #9fe8b6; --hover: #1e2430; --tag: #2e2747; --tag-fg: #c9bdf5;
+    --eng: #46320f; --eng-fg: #f5cf8e;
   }}
 }}
 * {{ box-sizing: border-box; }}
@@ -338,6 +416,8 @@ td.na {{ color: var(--muted); }}
 tbody tr:hover td {{ background: var(--hover); }}
 tbody tr:last-child td {{ border-bottom: 0; }}
 .best, tbody tr:hover td.best {{ background: var(--best-bg); color: var(--best-fg); font-weight: 650; }}
+.engine {{ font-size: 11px; background: var(--eng); color: var(--eng-fg); padding: 1px 6px;
+  border-radius: 4px; font-weight: 500; }}
 .fp {{ font-size: 11px; background: var(--tag); color: var(--tag-fg); padding: 1px 6px;
   border-radius: 4px; font-weight: 500; }}
 .empty {{ padding: 12px; margin: 0; color: var(--muted); }}

@@ -1,9 +1,11 @@
 """Benchmark specs: the unit of "have it / missing it".
 
-A spec is the smallest independently recorded oMLX result: one single-request
+A spec is the smallest independently recorded result: one single-request
 perf test at one prompt length, one batch test, one accuracy suite at one
 sample size, or one context probe. Specs are identified by `key`, a canonical
 string of kind + params, so the same desired test always maps to the same key.
+Keys do not name the engine: the engine is recorded next to the key (like the
+settings fingerprint), so the same test on oMLX and TensorFold compares directly.
 """
 
 from __future__ import annotations
@@ -29,6 +31,10 @@ ACCURACY_SUITES = {
 }
 ACCURACY_BATCH_SIZES = {1, 2, 4, 8, 16, 32}
 CONTEXT_TARGETS = {16384, 32768, 65536, 131072, 262144, 524288}
+ENGINES = ("omlx", "tensorfold")
+# Kinds that need oMLX's built-in benchmarks; everything else omlxbench runs
+# itself through the chat API, on any engine.
+OMLX_ONLY_KINDS = {"perf.single", "perf.batch", "accuracy", "context"}
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,8 @@ class Spec:
             return f"tools {p['category']} n={n}{think}"
         if self.kind == "pulse_memory":
             return f"pulse memory {p['suite']} ×{p['repeats']}"
+        if self.kind == "stream_perf":
+            return f"stream pp{p['pp']}/tg{p['tg']}"
         return f"context {p['target_tokens']}"
 
 
@@ -123,6 +131,13 @@ def pulse_memory(repeats: int = 3) -> Spec:
     return Spec.make("pulse_memory", suite=SUITE, repeats=repeats)
 
 
+def stream_perf(pp: int, tg: int = 128) -> Spec:
+    """Client-side streamed speed test at one prompt length (stream_perf.py)."""
+    from .stream_perf import SUITE
+
+    return Spec.make("stream_perf", suite=SUITE, pp=pp, tg=tg)
+
+
 def context(target_tokens: int) -> Spec:
     return Spec.make("context", target_tokens=target_tokens)
 
@@ -136,9 +151,10 @@ class TargetGroup:
     specs: list[Spec]
     include: list[str] = field(default_factory=lambda: ["*"])
     exclude: list[str] = field(default_factory=list)
+    engines: list[str] = field(default_factory=lambda: ["omlx"])
 
-    def applies_to(self, model_id: str) -> bool:
-        return _matches(model_id, self.include, self.exclude)
+    def applies_to(self, model_id: str, engine: str = "omlx") -> bool:
+        return engine in self.engines and _matches(model_id, self.include, self.exclude)
 
 
 @dataclass
@@ -238,13 +254,29 @@ def load_targets(path: Path) -> Targets:
             if repeats < 1:
                 raise ValueError("targets.toml: pulse_memory repeats must be at least 1")
             specs.append(pulse_memory(repeats))
+        if "stream_perf" in b:
+            cfg = b["stream_perf"]
+            tg = int(cfg.get("generation_length", 128))
+            for pp in cfg.get("prompt_lengths", []):
+                _check(pp, PERF_PROMPT_LENGTHS, "stream_perf prompt_lengths")
+                specs.append(stream_perf(int(pp), tg))
         if not specs:
             raise ValueError(f"targets.toml: [[benchmarks]] #{i + 1} defines no tests")
+        engines = list(b.get("engines", ["omlx"]))
+        for e in engines:
+            _check(e, set(ENGINES), "engines")
+        if any(e != "omlx" for e in engines):
+            bad = sorted({s.label() for s in specs if s.kind in OMLX_ONLY_KINDS})
+            if bad:
+                raise ValueError(f"targets.toml: [[benchmarks]] #{i + 1}: {', '.join(bad)} "
+                                 "need oMLX's built-in benchmarks and can't run on "
+                                 + ", ".join(e for e in engines if e != "omlx"))
         groups.append(TargetGroup(
             tier=int(b.get("tier", 1)),
             specs=specs,
             include=list(b.get("models", ["*"])),
             exclude=list(b.get("exclude_models", [])),
+            engines=engines,
         ))
     return Targets(
         include=list(models.get("include", ["*"])),

@@ -1,5 +1,9 @@
 """The background loop: wait for an idle server, run one unit, record, repeat.
 
+Two engines are supported, oMLX and TensorFold, one running at a time. Each
+loop the runner checks which one is up and plans work for that engine only;
+if both are up it waits (a fair comparison needs the machine to itself).
+
 Benchmarks are a low-priority guest on the server. The runner only starts a
 run after the server has seen no API traffic for `quiet_minutes`, and cancels
 its run as soon as it sees real use or a pause request. Results oMLX has
@@ -34,7 +38,7 @@ from .client import (NET_ERRORS, EventPump, OmlxClient, OmlxError, RejectedReque
 from .control import daemon_alive, pause_state
 from .db import DB, dumps, now
 from .importer import ImportState, import_ui
-from .planner import HARNESS_KINDS, WorkUnit, plan
+from .planner import HARNESS_KINDS, WorkUnit, missing_by_model, plan
 from .snapshot import State, capture_state
 from .specs import Spec, Targets, perf_spec_from_result
 
@@ -105,9 +109,21 @@ class _Shutdown(Exception):
     pass
 
 
+def engine_up(client) -> bool:
+    try:
+        h = client.health()
+    except NET_ERRORS:
+        return False
+    return h.get("http_status") == 200
+
+
 class Runner:
-    def __init__(self, client: OmlxClient, db: DB, targets_loader, quiet_minutes: float | None):
-        self.client = client
+    def __init__(self, clients: dict, db: DB, targets_loader, quiet_minutes: float | None):
+        """`clients`: engine name -> client, for the engines configured."""
+        self.clients = clients
+        self.omlx: OmlxClient | None = clients.get("omlx")
+        self.engine = "omlx" if self.omlx else next(iter(clients))
+        self.client = clients[self.engine]
         self.db = db
         self.load_targets = targets_loader
         self.quiet_minutes_override = quiet_minutes
@@ -128,7 +144,13 @@ class Runner:
             self.reconcile_stale_runs()
             while True:
                 self.db.set_control("daemon_heartbeat", now())
-                self.maybe_import_ui()
+                ok, why = self.select_engine()
+                if not ok:
+                    self._say(why)
+                    time.sleep(IDLE_SLEEP_SECONDS)
+                    continue
+                if self.engine == "omlx":
+                    self.maybe_import_ui()
                 targets: Targets = self.load_targets()
                 quiet_min = (self.quiet_minutes_override
                              if self.quiet_minutes_override is not None else targets.quiet_minutes)
@@ -139,16 +161,17 @@ class Runner:
                         return
                     time.sleep(IDLE_SLEEP_SECONDS)
                     continue
-                self.maybe_snapshot_usage()
+                if self.engine == "omlx":
+                    self.maybe_snapshot_usage()
                 try:
                     state = capture_state(self.client, self.db)
                 except NET_ERRORS as e:
                     self._say(f"server unreachable: {e}")
                     time.sleep(IDLE_SLEEP_SECONDS)
                     continue
-                units = plan(self.db, targets, state.models, state.env.hash)
+                units = plan(self.db, targets, state.models, state.env.hash, self.engine)
                 if not units:
-                    self._say("nothing to do: every target has a result")
+                    self._say(self.nothing_to_do(targets, state))
                     if once:
                         return
                     time.sleep(NOTHING_TO_DO_SLEEP_SECONDS)
@@ -162,6 +185,35 @@ class Runner:
         finally:
             if self.db.get_control("daemon_pid") == str(os.getpid()):
                 self.db.set_control("daemon_pid", None)
+
+    def select_engine(self) -> tuple[bool, str]:
+        """Pick the engine that is up. Both up, or neither: wait."""
+        up = [name for name, c in self.clients.items() if engine_up(c)]
+        if len(up) > 1:
+            self.traffic.touch()
+            return False, f"both {' and '.join(up)} are up; benchmarks wait until only one runs"
+        if not up:
+            return False, "no engine is up (" + ", ".join(self.clients) + ")"
+        if up[0] != self.engine:
+            log.info("engine is now %s", up[0])
+            self.engine, self.client = up[0], self.clients[up[0]]
+            if self.engine == "omlx":
+                self.traffic = TrafficWatch()
+            else:
+                from .engines import NoRejections
+
+                self.traffic = TrafficWatch(rejected=NoRejections())
+        return True, "ok"
+
+    def nothing_to_do(self, targets: Targets, state: State) -> str:
+        if self.engine == "omlx":
+            return "nothing to do: every target has a result"
+        served = ", ".join(m.model_id for m in state.models) or "nothing"
+        others = missing_by_model(self.db, targets, self.engine)
+        if not others:
+            return f"nothing to do on {self.engine} (serving {served}): every target has a result"
+        todo = ", ".join(f"{m} ({n} missing)" for m, n in others.items())
+        return f"{self.engine} serves {served}, which needs nothing; switch it to: {todo}"
 
     def _on_sigterm(self, *_):
         raise _Shutdown()
@@ -195,6 +247,8 @@ class Runner:
         return True, "ok"
 
     def other_bench_running(self) -> str | None:
+        if self.engine != "omlx":
+            return None  # no built-in benchmarks to collide with
         if self.client.perf_active().get("running"):
             return "performance"
         if self.client.context_active().get("running"):
@@ -235,12 +289,12 @@ class Runner:
         """Close out runs a previous runner left 'running' (crash, reboot)."""
         for run in self.db.q("SELECT * FROM runs WHERE status = 'running' AND source = 'runner'"):
             server_status = None
-            if run["kind"] in HARNESS_KINDS:
+            if run["kind"] in HARNESS_KINDS or self.omlx is None:
                 # Our own requests died with the old process; nothing to cancel.
                 self.db.finish_run(run["id"], status="interrupted", error="runner exited mid-run")
                 continue
             try:
-                result = self.client.results(run["kind"], run["omlx_bench_id"])
+                result = self.omlx.results(run["kind"], run["omlx_bench_id"])
                 if run["kind"] == "accuracy":
                     ours = result.get("current_bench_id") == run["omlx_bench_id"]
                     server_status = "running" if ours and result.get("running") else None
@@ -248,7 +302,7 @@ class Runner:
                     server_status = result.get("status")
                 if server_status == "running":
                     log.info("cancelling orphaned run %s (%s)", run["id"], run["omlx_bench_id"])
-                    cancel_orphan(self.client, run["kind"], run["omlx_bench_id"], run["model_id"])
+                    cancel_orphan(self.omlx, run["kind"], run["omlx_bench_id"], run["model_id"])
             except NET_ERRORS:
                 pass
             self.db.finish_run(run["id"], status="interrupted",
@@ -259,10 +313,15 @@ class Runner:
     def execute(self, unit: WorkUnit, state: State) -> None:
         log.info("starting %s", unit.describe())
         request = unit.request()
+        if unit.engine != "omlx":
+            from .harness import omlx_sampling
+
+            request["sampling"] = omlx_sampling(self.db, unit.model.model_id)
         run_id = self.db.create_run(
             kind=unit.kind, model_id=unit.model.model_id,
             model_snapshot_id=state.snapshot_ids.get(unit.model.model_id),
             environment_id=state.env_id, request=request, spec_keys=[s.key for s in unit.specs],
+            engine=unit.engine,
         )
         if unit.kind in HARNESS_KINDS:
             from .harness import EXECUTIONS

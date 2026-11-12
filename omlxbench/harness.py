@@ -1,5 +1,6 @@
-"""Suites omlxbench runs itself through oMLX's chat API (not oMLX built-ins):
-BFCL tool calling and the Hermes-shaped agent-turns replay.
+"""Suites omlxbench runs itself through the chat API (not oMLX built-ins):
+BFCL tool calling, the Hermes-shaped agent-turns replay, Pulse memory and the
+streamed speed test. They run on any engine (oMLX or TensorFold).
 
 Unlike the built-in benchmarks, these own their requests, so yielding is
 clean: dropping our connection makes oMLX abort just our request, and the
@@ -39,6 +40,27 @@ MAX_CONSECUTIVE_ERRORS = 3
 # failed load, no memory to load it), as opposed to rejecting one request.
 # Scoring these as wrong answers would record a model that never ran.
 UNSERVABLE_STATUSES = (404, 409, 503, 507)
+# oMLX applies a model's saved sampling settings when a request sends none
+# (as Hermes's requests don't). Other engines get the same values sent
+# explicitly, so engines are compared at the same sampling.
+SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty")
+
+
+def omlx_sampling(db: DB, model_id: str) -> dict:
+    """The model's saved sampling settings in its newest oMLX snapshot."""
+    row = db.q1("SELECT settings_json FROM model_snapshots WHERE model_id = ? AND engine = 'omlx'"
+                " ORDER BY id DESC LIMIT 1", model_id)
+    settings = json.loads(row["settings_json"]) if row and row["settings_json"] else {}
+    return {k: settings[k] for k in SAMPLING_KEYS if settings.get(k) is not None}
+
+
+def server_timing(data: dict) -> tuple[float | None, float | None]:
+    """(time to first token, total time) as the server reports them: oMLX in
+    `usage`, TensorFold in its own `tensorfold` block."""
+    u = data.get("usage") or {}
+    tf = data.get("tensorfold") or {}
+    return (u.get("time_to_first_token") or tf.get("time_to_first_token"),
+            u.get("total_time") or tf.get("seconds"))
 
 
 class _Aborted(Exception):
@@ -54,15 +76,43 @@ class _Harness:
         self.unit = unit
         self.model = unit.model
         self.spec = unit.specs[0]
+        self.engine = unit.engine
         self.env_hash = env_hash
         self.run_id = run_id
         self.cancel_reason: str | None = None
         self.baseline = 0
         self.ours_completed = 0
-        self.rejected = RejectedRequests()
+        self.sampling = {} if self.engine == "omlx" else omlx_sampling(db, self.model.model_id)
+        if self.engine == "omlx":
+            self.rejected = RejectedRequests()
+        else:
+            from .engines import NoRejections
+
+            self.rejected = NoRejections()
         self.rejected.new()  # start counting from here
         self.rejected_total = 0
         self.ours_rejected = 0  # our own non-2xx responses also appear in the log
+
+    # -- requests -----------------------------------------------------------
+
+    def adapt(self, body: dict) -> dict:
+        """The request as this engine needs it: its model name, and for
+        engines other than oMLX the thinking switch where they read it and
+        oMLX's sampling for the model sent explicitly."""
+        body = {**body, "model": self.model.request_model}
+        if self.engine != "omlx":
+            body = {**self.sampling, **body}
+            if "enable_thinking" in body:
+                body["chat_template_kwargs"] = {
+                    **(body.get("chat_template_kwargs") or {}),
+                    "enable_thinking": bool(body["enable_thinking"])}
+        return body
+
+    def mark(self, ok: bool, error: str | None = None, spec=None) -> None:
+        spec = spec or self.spec
+        self.db.mark_spec(self.model.model_id, spec.key, self.model.settings_fingerprint,
+                          ok=ok, run_id=self.run_id, error=None if ok else error,
+                          environment_hash=None if ok else self.env_hash, engine=self.engine)
 
     # -- yielding -----------------------------------------------------------
 
@@ -83,6 +133,9 @@ class _Harness:
         except NET_ERRORS:
             return None, ""
         loaded = status.get("loaded_models") or []
+        if self.engine != "omlx" and self.model.request_model not in loaded:
+            # TensorFold serves one model; the user switched it in the app.
+            return "model_switched", f"{self.engine} now serves {', '.join(loaded) or 'nothing'}"
         completed = (status.get("total_requests") or 0) - self.baseline
         if completed > self.ours_completed:
             return "user_traffic", f"{completed} API requests completed, {self.ours_completed} ours"
@@ -100,20 +153,24 @@ class _Harness:
 
     def chat(self, body: dict) -> httpx.Response:
         """POST a chat completion (non-streaming)."""
+        body = self.adapt(body)
         return self._abandonable(lambda http: http.post("/v1/chat/completions", json=body))
 
     def chat_first_token(self, body: dict) -> dict:
         """Stream a chat completion and time its first token client-side.
 
-        Returns {"ttft": seconds or None, "usage": dict or None, "error":
-        str or None}. Streaming keeps the timing even when oMLX ends the
-        response with an error (e.g. `incomplete_tool_call` when a reply is
-        cut off inside a tool call), which a non-streaming request loses.
+        Returns {"ttft": seconds or None, "t_last": seconds to the last
+        token, "elapsed", "usage": dict or None, "server": the engine's own
+        timing block or None, "finish_reason", "error": str or None}.
+        Streaming keeps the timing even when oMLX ends the response with an
+        error (e.g. `incomplete_tool_call` when a reply is cut off inside a
+        tool call), which a non-streaming request loses.
         """
-        body = {**body, "stream": True, "stream_options": {"include_usage": True}}
+        body = {**self.adapt(body), "stream": True, "stream_options": {"include_usage": True}}
 
         def stream(http: httpx.Client) -> dict:
-            out: dict = {"ttft": None, "usage": None, "error": None}
+            out: dict = {"ttft": None, "t_last": None, "usage": None, "server": None,
+                         "finish_reason": None, "error": None}
             t0 = time.monotonic()
             with http.stream("POST", "/v1/chat/completions", json=body) as resp:
                 if resp.status_code >= 400:
@@ -127,11 +184,17 @@ class _Harness:
                     if "error" in chunk:
                         out["error"] = json.dumps(chunk["error"])[:300]
                     out["usage"] = chunk.get("usage") or out["usage"]
-                    delta = ((chunk.get("choices") or [{}])[0].get("delta") or {})
-                    if out["ttft"] is None and any(delta.get(k) for k in
-                                                   ("content", "reasoning_content", "reasoning",
-                                                    "tool_calls")):
-                        out["ttft"] = time.monotonic() - t0
+                    out["server"] = chunk.get("tensorfold") or out["server"]
+                    choice = (chunk.get("choices") or [{}])[0]
+                    out["finish_reason"] = choice.get("finish_reason") or out["finish_reason"]
+                    delta = choice.get("delta") or {}
+                    if any(delta.get(k) for k in ("content", "reasoning_content", "reasoning",
+                                                  "tool_calls")):
+                        t = time.monotonic() - t0
+                        if out["ttft"] is None:
+                            out["ttft"] = t
+                        out["t_last"] = t
+            out["elapsed"] = time.monotonic() - t0
             return out
 
         return self._abandonable(stream)
@@ -245,13 +308,10 @@ class _CaseSuite(_Harness):
             log.warning("  %s run failed: %s", self.what, e)
         n, ok = self.tally()
         if n >= len(cases):
-            self.db.mark_spec(self.model.model_id, self.spec.key, self.model.settings_fingerprint,
-                              ok=True, run_id=self.run_id)
+            self.mark(True)
             log.info("  result %s: %.1f%% (%s/%s)", self.what, 100 * ok / n if n else 0, ok, n)
         elif status == "error":
-            self.db.mark_spec(self.model.model_id, self.spec.key, self.model.settings_fingerprint,
-                              ok=False, run_id=self.run_id, error=error,
-                              environment_hash=self.env_hash)
+            self.mark(False, error)
         self.finish(status, error, n, len(cases))
 
 
@@ -268,8 +328,9 @@ class ToolsExecution(_CaseSuite):
 
     def done(self) -> set[str]:
         return {r["case_id"] for r in self.db.q(
-            "SELECT case_id FROM tool_cases WHERE model_id=? AND spec_key=? AND settings_fingerprint=?",
-            self.model.model_id, self.spec.key, self.model.settings_fingerprint)}
+            "SELECT case_id FROM tool_cases WHERE model_id=? AND engine=? AND spec_key=?"
+            " AND settings_fingerprint=?",
+            self.model.model_id, self.engine, self.spec.key, self.model.settings_fingerprint)}
 
     def body(self, case: bfcl.Case) -> dict:
         thinking = self.spec.p["enable_thinking"]
@@ -290,8 +351,8 @@ class ToolsExecution(_CaseSuite):
     def tally(self) -> tuple[int, int]:
         r = self.db.q1(
             "SELECT count(*) AS n, sum(correct) AS ok FROM tool_cases"
-            " WHERE model_id=? AND spec_key=? AND settings_fingerprint=?",
-            self.model.model_id, self.spec.key, self.model.settings_fingerprint)
+            " WHERE model_id=? AND engine=? AND spec_key=? AND settings_fingerprint=?",
+            self.model.model_id, self.engine, self.spec.key, self.model.settings_fingerprint)
         return r["n"], r["ok"] or 0
 
     def record(self, case: bfcl.Case, resp: httpx.Response, elapsed: float) -> None:
@@ -311,15 +372,16 @@ class ToolsExecution(_CaseSuite):
             if not message.get("tool_calls") and _looks_like_tool_call(message.get("content")):
                 reason += " (text resembles a tool call: parser did not extract it)"
         usage = data.get("usage") or {}
+        ttft, total = server_timing(data)
         self.db.x(
-            "INSERT OR REPLACE INTO tool_cases(run_id, model_id, spec_key, settings_fingerprint,"
-            " category, case_id, correct, reason, tool_calls_json, content, finish_reason,"
-            " prompt_tokens, completion_tokens, time_to_first_token, total_time, raw_json,"
-            " recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            self.run_id, self.model.model_id, self.spec.key, self.model.settings_fingerprint,
-            case.category, case.id, int(correct), reason, dumps(calls), message.get("content"),
-            finish, usage.get("prompt_tokens"), usage.get("completion_tokens"),
-            usage.get("time_to_first_token"), usage.get("total_time"), dumps(data), now(),
+            "INSERT OR REPLACE INTO tool_cases(run_id, model_id, engine, spec_key,"
+            " settings_fingerprint, category, case_id, correct, reason, tool_calls_json, content,"
+            " finish_reason, prompt_tokens, completion_tokens, time_to_first_token, total_time,"
+            " raw_json, recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            self.run_id, self.model.model_id, self.engine, self.spec.key,
+            self.model.settings_fingerprint, case.category, case.id, int(correct), reason,
+            dumps(calls), message.get("content"), finish, usage.get("prompt_tokens"),
+            usage.get("completion_tokens"), ttft, total or elapsed, dumps(data), now(),
         )
 
 
@@ -376,31 +438,40 @@ class AgentTurnsExecution(_Harness):
             status, error = "error", str(e)
             log.warning("  agent turns failed: %s", e)
         if recorded == agent_turns.STEPS:
-            self.db.mark_spec(self.model.model_id, self.spec.key, self.model.settings_fingerprint,
-                              ok=True, run_id=self.run_id)
+            self.mark(True)
         elif status == "error":
-            self.db.mark_spec(self.model.model_id, self.spec.key, self.model.settings_fingerprint,
-                              ok=False, run_id=self.run_id, error=error,
-                              environment_hash=self.env_hash)
+            self.mark(False, error)
         self.finish(status, error, recorded, agent_turns.STEPS)
 
     def record(self, step: int, result: dict) -> None:
         u = result["usage"] or {}
-        # oMLX's own TTFT when it reported usage; ours otherwise (an error
-        # ending, e.g. a reply cut off inside a tool call, has no usage).
-        ttft = u.get("time_to_first_token") or result["ttft"]
+        tf = result.get("server") or {}
+        # The server's own TTFT when it reported one (oMLX in usage,
+        # TensorFold in its own block); ours otherwise (an error ending, e.g.
+        # a reply cut off inside a tool call, has no usage).
+        ttft = u.get("time_to_first_token") or tf.get("time_to_first_token") or result["ttft"]
+        total = u.get("total_time") or tf.get("seconds")
+        gen_tps = u.get("generation_tokens_per_second")
+        if gen_tps is None and total and ttft and (u.get("completion_tokens") or 0) > 1 \
+                and total > ttft:
+            gen_tps = (u["completion_tokens"] - 1) / (total - ttft)
         prompt = u.get("prompt_tokens")
+        cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+        prompt_tps = u.get("prompt_tokens_per_second")
+        if prompt_tps is None and tf.get("prefill_seconds") and prompt:
+            # Like oMLX's figure: speed over the uncached tokens.
+            prompt_tps = (prompt - cached) / tf["prefill_seconds"]
         log.info("  step %d: %s prompt tokens, ttft %.1fs%s", step, prompt, ttft,
                  f" ({result['error']})" if result["error"] else "")
         self.db.x(
-            "INSERT INTO agent_turns(run_id, model_id, spec_key, settings_fingerprint, step,"
-            " prompt_tokens, cached_tokens, completion_tokens, time_to_first_token,"
+            "INSERT INTO agent_turns(run_id, model_id, engine, spec_key, settings_fingerprint,"
+            " step, prompt_tokens, cached_tokens, completion_tokens, time_to_first_token,"
             " prompt_tps, generation_tps, total_time, raw_json, recorded_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            self.run_id, self.model.model_id, self.spec.key, self.model.settings_fingerprint,
-            step, prompt, (u.get("prompt_tokens_details") or {}).get("cached_tokens"),
-            u.get("completion_tokens"), ttft, u.get("prompt_tokens_per_second"),
-            u.get("generation_tokens_per_second"), u.get("total_time"),
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            self.run_id, self.model.model_id, self.engine, self.spec.key,
+            self.model.settings_fingerprint, step, prompt,
+            (u.get("prompt_tokens_details") or {}).get("cached_tokens"),
+            u.get("completion_tokens"), ttft, prompt_tps, gen_tps, total,
             dumps({**result, "client_ttft": result["ttft"]}), now(),
         )
 
@@ -418,9 +489,9 @@ class PulseMemoryExecution(_CaseSuite):
 
     def done(self) -> set[str]:
         return {f"{r['case_id']}#{r['trial']}" for r in self.db.q(
-            "SELECT case_id, trial FROM pulse_memory_cases WHERE model_id=? AND spec_key=?"
-            " AND settings_fingerprint=?",
-            self.model.model_id, self.spec.key, self.model.settings_fingerprint)}
+            "SELECT case_id, trial FROM pulse_memory_cases WHERE model_id=? AND engine=?"
+            " AND spec_key=? AND settings_fingerprint=?",
+            self.model.model_id, self.engine, self.spec.key, self.model.settings_fingerprint)}
 
     def body(self, case: tuple) -> dict:
         from . import pulse_memory
@@ -430,8 +501,8 @@ class PulseMemoryExecution(_CaseSuite):
     def tally(self) -> tuple[int, int]:
         r = self.db.q1(
             "SELECT count(*) AS n, sum(pulse_ok) AS ok FROM pulse_memory_cases"
-            " WHERE model_id=? AND spec_key=? AND settings_fingerprint=?",
-            self.model.model_id, self.spec.key, self.model.settings_fingerprint)
+            " WHERE model_id=? AND engine=? AND spec_key=? AND settings_fingerprint=?",
+            self.model.model_id, self.engine, self.spec.key, self.model.settings_fingerprint)
         return r["n"], r["ok"] or 0
 
     def record(self, case: tuple, resp: httpx.Response, elapsed: float) -> None:
@@ -443,7 +514,7 @@ class PulseMemoryExecution(_CaseSuite):
         except ValueError:
             data = {"error": resp.text[:2000]}
         usage = data.get("usage") or {}
-        total = usage.get("total_time") or elapsed
+        total = server_timing(data)[1] or elapsed
         if resp.status_code >= 400 or not data.get("choices"):
             content = finish = parsed = None
             pulse_ok = content_ok = False
@@ -456,15 +527,102 @@ class PulseMemoryExecution(_CaseSuite):
         if not pulse_ok:
             log.info("  %s#%d: %s", c.id, trial, reason)
         self.db.x(
-            "INSERT OR REPLACE INTO pulse_memory_cases(run_id, model_id, spec_key,"
+            "INSERT OR REPLACE INTO pulse_memory_cases(run_id, model_id, engine, spec_key,"
             " settings_fingerprint, case_id, trial, pulse_ok, content_ok, reason, content,"
             " parsed_json, finish_reason, prompt_tokens, completion_tokens, total_time, raw_json,"
-            " recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            self.run_id, self.model.model_id, self.spec.key, self.model.settings_fingerprint,
+            " recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            self.run_id, self.model.model_id, self.engine, self.spec.key,
+            self.model.settings_fingerprint,
             c.id, trial, int(pulse_ok), int(content_ok), reason, content,
             None if parsed is None else dumps(parsed), finish, usage.get("prompt_tokens"),
             usage.get("completion_tokens"), total, dumps(data), now(),
         )
+
+
+class StreamPerfExecution(_Harness):
+    """Client-side streamed speed test, one spec (prompt length) per request,
+    each recorded as it finishes. See stream_perf.py."""
+
+    def _calibrate(self) -> tuple[float, int]:
+        """(chars per token, prompt overhead in tokens) for this model's
+        tokenizer, from two one-token requests. Also loads the model."""
+        from . import stream_perf
+
+        counts = []
+        for n in (0, stream_perf.CALIBRATION_CHARS):
+            resp = self.chat({"messages": stream_perf.messages(n), "max_tokens": 1,
+                              "enable_thinking": False})
+            if not resp.is_success:
+                self.ours_rejected += 1
+                raise OmlxStepError(f"calibration: HTTP {resp.status_code}: {resp.text[:300]}")
+            self.ours_completed += 1
+            counts.append((resp.json().get("usage") or {}).get("prompt_tokens"))
+        base, full = counts
+        if not base or not full or full <= base:
+            raise OmlxStepError(f"calibration: no usable prompt token counts ({counts})")
+        return stream_perf.CALIBRATION_CHARS / (full - base), base
+
+    def _reset_peak(self) -> None:
+        if self.engine == "tensorfold":
+            try:
+                self.client.http.get("/health", params={"reset_peak": 1})
+            except NET_ERRORS:
+                pass
+
+    def _peak(self) -> int | None:
+        if self.engine != "tensorfold":
+            return None  # oMLX doesn't expose per-request peak memory
+        try:
+            m = self.client.metrics()
+        except NET_ERRORS:
+            return None
+        v = m.get("device_memory_peak_bytes")
+        return int(v) if v else None
+
+    def run(self) -> None:
+        from . import stream_perf
+
+        status, error, recorded = "completed", None, 0
+        try:
+            self.rebaseline()
+            cpt, overhead = self._calibrate()
+            log.info("  %.2f chars/token, %d tokens of prompt overhead", cpt, overhead)
+            for spec in self.unit.specs:
+                if reason := self.should_yield(ours_in_flight=0):
+                    self.cancel_reason = reason
+                    raise _Aborted()
+                pp, tg = spec.p["pp"], spec.p["tg"]
+                body = {"messages": stream_perf.messages(stream_perf.chars_for(pp, cpt, overhead)),
+                        "max_tokens": tg, "enable_thinking": False}
+                self._reset_peak()
+                timing = self.chat_first_token(body)
+                timing["peak_memory_bytes"] = self._peak()
+                if timing["ttft"] is None:
+                    self.ours_rejected += bool(timing["error"])
+                    raise OmlxStepError(f"pp{pp}: no tokens: {timing['error']}")
+                self.ours_completed += 1
+                r = stream_perf.result(pp, tg, timing)
+                self.db.insert_perf_result(self.run_id, spec.key, r, None)
+                if r["prompt_tokens"] and r["prompt_tokens"] > overhead:
+                    # Code at scale tokenizes a little differently from the
+                    # calibration sample: size the next prompt from this one.
+                    cpt = stream_perf.chars_for(pp, cpt, overhead) / (r["prompt_tokens"] - overhead)
+                self.mark(True, spec=spec)
+                recorded += 1
+                log.info("  result stream pp%s (%s tokens): pp %.1f tok/s, tg %s tok/s, ttft %.0f ms",
+                         pp, r["prompt_tokens"], r["processing_tps"] or 0,
+                         "n/a" if r["gen_tps"] is None else f"{r['gen_tps']:.1f}", r["ttft_ms"])
+        except _Aborted:
+            status = "cancelled"
+            log.info("yielding the server (%s)", self.cancel_reason)
+        except (OmlxStepError, OSError, ValueError, *NET_ERRORS) as e:
+            status, error = "error", str(e)
+            log.warning("  stream perf failed: %s", e)
+            done = {s.key for s in self.unit.specs[:recorded]}
+            for spec in self.unit.specs:
+                if spec.key not in done:
+                    self.mark(False, error, spec=spec)
+        self.finish(status, error, recorded, len(self.unit.specs))
 
 
 class OmlxStepError(RuntimeError):
@@ -472,4 +630,4 @@ class OmlxStepError(RuntimeError):
 
 
 EXECUTIONS = {"tools": ToolsExecution, "agent_turns": AgentTurnsExecution,
-              "pulse_memory": PulseMemoryExecution}
+              "pulse_memory": PulseMemoryExecution, "stream_perf": StreamPerfExecution}

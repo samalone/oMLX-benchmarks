@@ -41,7 +41,11 @@ def digest(db: DB) -> dict:
 
     for p in db.q("SELECT * FROM v_latest_perf ORDER BY model_id, test_type DESC, pp, batch_size"):
         entry(p["model_id"])["perf"].append({
-            "test": "single" if p["test_type"] == "single" else f"batch{p['batch_size']}",
+            # single / batchN: oMLX's built-in benchmark; stream: omlxbench's
+            # client-side streamed test (stream_perf), on any engine
+            "test": (p["test_type"] if p["test_type"] in ("single", "stream")
+                     else f"batch{p['batch_size']}"),
+            "engine": p["engine"], "engine_version": p["engine_version"],
             "pp": p["pp"], "tg": p["tg"], "context_profile": p["context_profile"],
             "pp_tps": _r(p["processing_tps"]), "tg_tps": _r(p["gen_tps"]),
             # batch tests report a mean time to first token instead
@@ -53,6 +57,7 @@ def digest(db: DB) -> dict:
 
     for a in db.q("SELECT * FROM v_latest_accuracy ORDER BY model_id, suite"):
         entry(a["model_id"])["accuracy"].append({
+            "engine": a["engine"],
             "suite": a["suite"], "n": a["total"], "accuracy": _r(a["accuracy"], 4),
             "thinking": bool(a["thinking_used"]), "sampling": a["sampling_profile"],
             "truncated": a["truncated_count"], "time_s": _r(a["time_s"], 0),
@@ -62,16 +67,17 @@ def digest(db: DB) -> dict:
 
     for t in db.q("SELECT * FROM v_tools ORDER BY model_id, category"):
         entry(t["model_id"])["tools"].append({
-            "category": t["category"], "n": t["n"], "accuracy": _r(t["accuracy"], 4),
+            "engine": t["engine"], "category": t["category"], "n": t["n"], "accuracy": _r(t["accuracy"], 4),
             "avg_completion_tokens": _r(t["avg_completion_tokens"], 0),
             "avg_time_s": _r(t["avg_time_s"], 1), "settings": t["settings_fingerprint"],
             "measured": t["recorded_at"],
         })
 
     for a in db.q("SELECT * FROM v_agent_turns v WHERE run_id = (SELECT max(run_id) FROM"
-                  " v_agent_turns w WHERE w.model_id = v.model_id"
+                  " v_agent_turns w WHERE w.model_id = v.model_id AND w.engine = v.engine"
                   " AND w.settings_fingerprint = v.settings_fingerprint)"):
         entry(a["model_id"])["agent_turns"].append({
+            "engine": a["engine"],
             "first_prompt_tokens": a["first_prompt_tokens"], "cold_ttft_s": _r(a["cold_ttft_s"]),
             "cold_prefill_tps": _r(a["cold_prefill_tps"], 0),
             "warm_ttft_s": _r(a["warm_ttft_s"]), "warm_new_tokens": _r(a["warm_new_tokens"], 0),
@@ -82,6 +88,7 @@ def digest(db: DB) -> dict:
 
     for p in db.q("SELECT * FROM v_pulse_memory ORDER BY model_id"):
         entry(p["model_id"])["pulse_memory"].append({
+            "engine": p["engine"],
             "n": p["n"], "pulse_ok": _r(p["pulse_ok_rate"], 4), "content_ok": _r(p["content_ok_rate"], 4),
             "cases_with_failures": p["cases_with_failures"],
             "avg_time_s": _r(p["avg_time_s"], 1), "max_time_s": _r(p["max_time_s"], 1),
@@ -91,20 +98,28 @@ def digest(db: DB) -> dict:
 
     for c in db.q("SELECT * FROM v_context ORDER BY model_id, recorded_at"):
         entry(c["model_id"])["context"].append({
+            "engine": c["engine"],
             "target_tokens": c["target_tokens"], "verified_tokens": c["verified_tokens"],
             "capped_by": c["capped_by"], "prefill_tps": _r(c["prefill_tps"]),
             "settings": c["settings_fingerprint"], "measured": c["recorded_at"],
         })
 
     env = db.q1("SELECT * FROM environments ORDER BY last_seen DESC LIMIT 1")
+    versions = {r["engine"]: r["engine_version"] for r in db.q(
+        "SELECT engine, engine_version FROM environments e WHERE last_seen ="
+        " (SELECT max(last_seen) FROM environments f WHERE f.engine = e.engine)")}
     return {
         "hardware": None if env is None else {
             "chip": f"{env['chip']} {env['chip_variant']}".strip(),
             "memory_gb": env["memory_gb"], "gpu_cores": env["gpu_cores"],
-            "macos": env["macos_version"], "omlx": env["omlx_version"],
+            "macos": env["macos_version"], "omlx": versions.get("omlx"),
+            "engines": versions,  # newest version seen per engine
         },
         "models": list(models.values()),
     }
+
+
+_ENGINE_NAMES = {"omlx": "oMLX", "tensorfold": "TensorFold"}
 
 
 def _r(v, nd: int = 1):
@@ -115,8 +130,10 @@ def markdown(d: dict) -> str:
     out = []
     hw = d.get("hardware")
     if hw:
+        engines = ", ".join(f"{_ENGINE_NAMES.get(e, e)} {v}" for e, v in
+                            (hw.get("engines") or {"omlx": hw["omlx"]}).items())
         out.append(f"# oMLX benchmarks — {hw['chip']}, {hw['memory_gb']} GB, macOS {hw['macos']}, "
-                   f"oMLX {hw['omlx']}\n")
+                   f"{engines}\n")
     for m in d["models"]:
         if not (m["perf"] or m["accuracy"] or m["tools"] or m["agent_turns"] or m["pulse_memory"]
                 or m["context"]):
@@ -126,11 +143,11 @@ def markdown(d: dict) -> str:
         out.append(f"{m.get('arch')} · {bits:g}-bit · {m.get('size_gb')} GB"
                    if bits else f"{m.get('arch')} · {m.get('size_gb')} GB")
         if m["perf"]:
-            out.append("\n| test | pp | pp tok/s | tg tok/s | ttft ms | peak GB | settings |")
-            out.append("|---|---|---|---|---|---|---|")
+            out.append("\n| engine | test | pp | pp tok/s | tg tok/s | ttft ms | peak GB | settings |")
+            out.append("|---|---|---|---|---|---|---|---|")
             for p in m["perf"]:
-                out.append(f"| {p['test']} | {p['pp']} | {p['pp_tps']} | {p['tg_tps']} | "
-                           f"{p['ttft_ms']} | {p['peak_mem_gb']} | {p['settings']} |")
+                out.append(f"| {p['engine']} | {p['test']} | {p['pp']} | {p['pp_tps']} | "
+                           f"{p['tg_tps']} | {p['ttft_ms']} | {p['peak_mem_gb']} | {p['settings']} |")
         if m["accuracy"]:
             out.append("\n| suite | n | accuracy | thinking | settings |")
             out.append("|---|---|---|---|---|")
@@ -138,18 +155,18 @@ def markdown(d: dict) -> str:
                 out.append(f"| {a['suite']} | {a['n']} | {100 * (a['accuracy'] or 0):.1f}% | "
                            f"{a['thinking']} | {a['settings']} |")
         if m["tools"]:
-            out.append("\n| tool calling | n | accuracy | avg s |")
-            out.append("|---|---|---|---|")
+            out.append("\n| tool calling | engine | n | accuracy | avg s |")
+            out.append("|---|---|---|---|---|")
             for t in m["tools"]:
-                out.append(f"| {t['category']} | {t['n']} | {100 * (t['accuracy'] or 0):.1f}% | "
-                           f"{t['avg_time_s']} |")
+                out.append(f"| {t['category']} | {t['engine']} | {t['n']} | "
+                           f"{100 * (t['accuracy'] or 0):.1f}% | {t['avg_time_s']} |")
         for a in m["agent_turns"]:
-            out.append(f"\nAgent turns ({a['first_prompt_tokens']}→{a['last_prompt_tokens']} tokens): "
+            out.append(f"\nAgent turns on {a['engine']} ({a['first_prompt_tokens']}→{a['last_prompt_tokens']} tokens): "
                        f"session start {a['cold_ttft_s']}s to first token; each later step "
                        f"(~{a['warm_new_tokens']:.0f} new tokens) {a['warm_ttft_s']}s on average, "
                        f"{a['last_ttft_s']}s at the end")
         for p in m["pulse_memory"]:
-            out.append(f"\nPulse memory (JSON output, {p['n']} requests): Pulse accepts "
+            out.append(f"\nPulse memory on {p['engine']} (JSON output, {p['n']} requests): Pulse accepts "
                        f"{100 * (p['pulse_ok'] or 0):.0f}%, sensible {100 * (p['content_ok'] or 0):.0f}%, "
                        f"{p['avg_time_s']}s average")
         for c in m["context"]:

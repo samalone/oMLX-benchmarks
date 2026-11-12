@@ -384,10 +384,197 @@ FROM pulse_memory_cases p
 GROUP BY p.model_id, p.settings_fingerprint, p.spec_key;
 """
 
+_SCHEMA_V7 = """
+-- The inference engine (omlx | tensorfold) becomes a dimension next to the
+-- settings fingerprint. Everything recorded before is oMLX.
+DROP VIEW v_latest_perf;
+DROP VIEW v_perf;
+DROP VIEW v_latest_accuracy;
+DROP VIEW v_accuracy;
+DROP VIEW v_context;
+DROP VIEW v_tools;
+DROP VIEW v_agent_turns;
+DROP VIEW v_pulse_memory;
+
+ALTER TABLE environments ADD COLUMN engine TEXT NOT NULL DEFAULT 'omlx';
+ALTER TABLE environments ADD COLUMN engine_version TEXT;
+UPDATE environments SET engine_version = omlx_version;
+ALTER TABLE model_snapshots ADD COLUMN engine TEXT NOT NULL DEFAULT 'omlx';
+ALTER TABLE model_snapshots ADD COLUMN api_model TEXT;
+ALTER TABLE runs ADD COLUMN engine TEXT NOT NULL DEFAULT 'omlx';
+ALTER TABLE agent_turns ADD COLUMN engine TEXT NOT NULL DEFAULT 'omlx';
+
+CREATE TABLE spec_status_new (
+    model_id TEXT NOT NULL,
+    engine TEXT NOT NULL DEFAULT 'omlx',
+    spec_key TEXT NOT NULL,
+    settings_fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL,               -- ok | failed
+    attempts INTEGER NOT NULL DEFAULT 0,
+    failed_environment_hash TEXT,
+    last_error TEXT,
+    last_run_id INTEGER REFERENCES runs(id),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (model_id, engine, spec_key, settings_fingerprint)
+);
+INSERT INTO spec_status_new(model_id, spec_key, settings_fingerprint, state, attempts,
+    failed_environment_hash, last_error, last_run_id, updated_at)
+SELECT model_id, spec_key, settings_fingerprint, state, attempts, failed_environment_hash,
+       last_error, last_run_id, updated_at FROM spec_status;
+DROP TABLE spec_status;
+ALTER TABLE spec_status_new RENAME TO spec_status;
+
+CREATE TABLE tool_cases_new (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    model_id TEXT NOT NULL,
+    engine TEXT NOT NULL DEFAULT 'omlx',
+    spec_key TEXT NOT NULL,
+    settings_fingerprint TEXT NOT NULL,
+    category TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    correct INTEGER NOT NULL,
+    reason TEXT,
+    tool_calls_json TEXT,
+    content TEXT,
+    finish_reason TEXT,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    time_to_first_token REAL,
+    total_time REAL,
+    raw_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    UNIQUE (model_id, engine, spec_key, settings_fingerprint, case_id)
+);
+INSERT INTO tool_cases_new(id, run_id, model_id, spec_key, settings_fingerprint, category,
+    case_id, correct, reason, tool_calls_json, content, finish_reason, prompt_tokens,
+    completion_tokens, time_to_first_token, total_time, raw_json, recorded_at)
+SELECT id, run_id, model_id, spec_key, settings_fingerprint, category, case_id, correct,
+       reason, tool_calls_json, content, finish_reason, prompt_tokens, completion_tokens,
+       time_to_first_token, total_time, raw_json, recorded_at FROM tool_cases;
+DROP TABLE tool_cases;
+ALTER TABLE tool_cases_new RENAME TO tool_cases;
+
+CREATE TABLE pulse_memory_cases_new (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    model_id TEXT NOT NULL,
+    engine TEXT NOT NULL DEFAULT 'omlx',
+    spec_key TEXT NOT NULL,
+    settings_fingerprint TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    trial INTEGER NOT NULL,
+    pulse_ok INTEGER NOT NULL,
+    content_ok INTEGER NOT NULL,
+    reason TEXT,
+    content TEXT,
+    parsed_json TEXT,
+    finish_reason TEXT,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    total_time REAL,
+    raw_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    UNIQUE (model_id, engine, spec_key, settings_fingerprint, case_id, trial)
+);
+INSERT INTO pulse_memory_cases_new(id, run_id, model_id, spec_key, settings_fingerprint,
+    case_id, trial, pulse_ok, content_ok, reason, content, parsed_json, finish_reason,
+    prompt_tokens, completion_tokens, total_time, raw_json, recorded_at)
+SELECT id, run_id, model_id, spec_key, settings_fingerprint, case_id, trial, pulse_ok,
+       content_ok, reason, content, parsed_json, finish_reason, prompt_tokens,
+       completion_tokens, total_time, raw_json, recorded_at FROM pulse_memory_cases;
+DROP TABLE pulse_memory_cases;
+ALTER TABLE pulse_memory_cases_new RENAME TO pulse_memory_cases;
+
+-- "latest" = newest row per (model, engine, spec, settings fingerprint).
+CREATE VIEW v_perf AS
+SELECT r.model_id, r.engine, m.settings_fingerprint, m.quant_bits, m.size_bytes, m.arch,
+       m.model_type, e.omlx_version, e.engine_version, e.chip, e.chip_variant, e.memory_gb,
+       p.*, r.started_at AS run_started_at, r.status AS run_status
+FROM perf_results p
+JOIN runs r ON r.id = p.run_id
+LEFT JOIN model_snapshots m ON m.id = r.model_snapshot_id
+LEFT JOIN environments e ON e.id = r.environment_id;
+
+CREATE VIEW v_latest_perf AS
+SELECT * FROM v_perf v
+WHERE v.id = (SELECT p2.id FROM v_perf p2
+              WHERE p2.model_id = v.model_id AND p2.engine = v.engine
+                AND p2.spec_key = v.spec_key
+                AND p2.settings_fingerprint IS v.settings_fingerprint
+              ORDER BY p2.recorded_at DESC, p2.id DESC LIMIT 1);
+
+CREATE VIEW v_accuracy AS
+SELECT r.model_id, r.engine, m.settings_fingerprint, m.quant_bits, m.size_bytes, m.arch,
+       m.model_type, e.omlx_version, e.engine_version, a.*, r.started_at AS run_started_at
+FROM accuracy_results a
+JOIN runs r ON r.id = a.run_id
+LEFT JOIN model_snapshots m ON m.id = r.model_snapshot_id
+LEFT JOIN environments e ON e.id = r.environment_id;
+
+CREATE VIEW v_latest_accuracy AS
+SELECT * FROM v_accuracy v
+WHERE v.id = (SELECT a2.id FROM v_accuracy a2
+              WHERE a2.model_id = v.model_id AND a2.engine = v.engine
+                AND a2.spec_key = v.spec_key
+                AND a2.settings_fingerprint IS v.settings_fingerprint
+              ORDER BY a2.recorded_at DESC, a2.id DESC LIMIT 1);
+
+CREATE VIEW v_context AS
+SELECT r.model_id, r.engine, m.settings_fingerprint, m.size_bytes, e.omlx_version,
+       e.engine_version, c.*
+FROM context_results c
+JOIN runs r ON r.id = c.run_id
+LEFT JOIN model_snapshots m ON m.id = r.model_snapshot_id
+LEFT JOIN environments e ON e.id = r.environment_id;
+
+CREATE VIEW v_tools AS
+SELECT t.model_id, t.engine, t.settings_fingerprint, t.spec_key, t.category,
+       count(*) AS n, sum(t.correct) AS correct, avg(t.correct) AS accuracy,
+       avg(t.completion_tokens) AS avg_completion_tokens, avg(t.total_time) AS avg_time_s,
+       max(t.recorded_at) AS recorded_at, m.quant_bits, m.size_bytes
+FROM tool_cases t
+LEFT JOIN model_snapshots m ON m.id = (SELECT max(id) FROM model_snapshots
+                                       WHERE model_id = t.model_id)
+GROUP BY t.model_id, t.engine, t.settings_fingerprint, t.spec_key;
+
+CREATE VIEW v_agent_turns AS
+WITH s AS (
+    SELECT a.*, a.prompt_tokens - coalesce(
+               lag(a.prompt_tokens) OVER (PARTITION BY a.run_id ORDER BY a.step), 0) AS new_tokens
+    FROM agent_turns a
+    JOIN runs r ON r.id = a.run_id AND r.status = 'completed'
+)
+SELECT run_id, model_id, engine, settings_fingerprint, spec_key, max(recorded_at) AS recorded_at,
+       count(*) AS steps,
+       max(CASE WHEN step = 1 THEN prompt_tokens END) AS first_prompt_tokens,
+       max(CASE WHEN step = 1 THEN time_to_first_token END) AS cold_ttft_s,
+       max(CASE WHEN step = 1 THEN prompt_tokens / time_to_first_token END) AS cold_prefill_tps,
+       avg(CASE WHEN step > 1 THEN time_to_first_token END) AS warm_ttft_s,
+       avg(CASE WHEN step > 1 THEN new_tokens END) AS warm_new_tokens,
+       sum(CASE WHEN step > 1 THEN new_tokens END)
+         / sum(CASE WHEN step > 1 THEN time_to_first_token END) AS warm_prefill_tps,
+       max(prompt_tokens) AS last_prompt_tokens,
+       max(CASE WHEN step = (SELECT max(step) FROM agent_turns b WHERE b.run_id = s.run_id)
+                THEN time_to_first_token END) AS last_ttft_s
+FROM s
+GROUP BY run_id;
+
+CREATE VIEW v_pulse_memory AS
+SELECT p.model_id, p.engine, p.settings_fingerprint, p.spec_key,
+       count(*) AS n, sum(p.pulse_ok) AS pulse_ok, avg(p.pulse_ok) AS pulse_ok_rate,
+       sum(p.content_ok) AS content_ok, avg(p.content_ok) AS content_ok_rate,
+       count(DISTINCT CASE WHEN p.pulse_ok = 0 THEN p.case_id END) AS cases_with_failures,
+       avg(p.completion_tokens) AS avg_completion_tokens, avg(p.total_time) AS avg_time_s,
+       max(p.total_time) AS max_time_s, max(p.recorded_at) AS recorded_at
+FROM pulse_memory_cases p
+GROUP BY p.model_id, p.engine, p.settings_fingerprint, p.spec_key;
+"""
+
 # Each entry upgrades the schema by one version. Append; never edit old ones
 # (v4's view moved to _V_AGENT_TURNS, applied by v5 for every database).
 MIGRATIONS: list[str] = [_SCHEMA_V1, _SCHEMA_V2, _SCHEMA_V3, _SCHEMA_V4, _SCHEMA_V5,
-                         _SCHEMA_V6]
+                         _SCHEMA_V6, _SCHEMA_V7]
 
 
 class DB:
@@ -440,13 +627,14 @@ class DB:
             self.x("UPDATE environments SET last_seen = ? WHERE id = ?", ts, row["id"])
             return row["id"]
         return self.x(
-            "INSERT INTO environments(hash, omlx_version, engines_json, chip, chip_variant,"
-            " memory_gb, gpu_cores, macos_version, perf_global_settings_json,"
+            "INSERT INTO environments(hash, engine, engine_version, omlx_version, engines_json,"
+            " chip, chip_variant, memory_gb, gpu_cores, macos_version, perf_global_settings_json,"
             " global_settings_json, device_info_json, first_seen, last_seen)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            env.hash, env.omlx_version, dumps(env.engines), env.chip, env.chip_variant,
-            env.memory_gb, env.gpu_cores, env.macos_version, dumps(env.perf_global_settings),
-            dumps(env.global_settings), dumps(env.device_info), ts, ts,
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            env.hash, env.engine, env.engine_version, env.omlx_version, dumps(env.engines),
+            env.chip, env.chip_variant, env.memory_gb, env.gpu_cores, env.macos_version,
+            dumps(env.perf_global_settings), dumps(env.global_settings), dumps(env.device_info),
+            ts, ts,
         )
 
     def upsert_model_snapshot(self, s: ModelSnapshot) -> int:
@@ -456,12 +644,14 @@ class DB:
             self.x("UPDATE model_snapshots SET last_seen = ? WHERE id = ?", ts, row["id"])
             return row["id"]
         return self.x(
-            "INSERT INTO model_snapshots(hash, model_id, model_path, source_repo_id, model_type,"
+            "INSERT INTO model_snapshots(hash, engine, api_model, model_id, model_path,"
+            " source_repo_id, model_type,"
             " engine_type, arch, quant_bits, quant_group_size, quant_mode, size_bytes,"
             " native_context, settings_fingerprint, feature_flags_json, settings_json,"
             " config_json, admin_model_json, first_seen, last_seen)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            s.hash, s.model_id, s.model_path, s.source_repo_id, s.model_type, s.engine_type,
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            s.hash, s.engine, s.api_model, s.model_id, s.model_path, s.source_repo_id,
+            s.model_type, s.engine_type,
             s.arch, s.quant_bits, s.quant_group_size, s.quant_mode, s.size_bytes,
             s.native_context, s.settings_fingerprint, dumps(s.flags), dumps(s.settings),
             dumps(s.config), dumps(s.admin_model), ts, ts,
@@ -471,13 +661,14 @@ class DB:
 
     def create_run(self, *, kind: str, model_id: str, model_snapshot_id: int | None,
                    environment_id: int | None, request: dict, spec_keys: list[str],
-                   omlx_bench_id: str | None = None, source: str = "runner") -> int:
+                   omlx_bench_id: str | None = None, source: str = "runner",
+                   engine: str = "omlx") -> int:
         with self.tx():
             run_id = self.x(
-                "INSERT INTO runs(kind, source, omlx_bench_id, model_id, model_snapshot_id,"
-                " environment_id, request_json, status, started_at)"
-                " VALUES (?,?,?,?,?,?,?,'running',?)",
-                kind, source, omlx_bench_id, model_id, model_snapshot_id, environment_id,
+                "INSERT INTO runs(kind, engine, source, omlx_bench_id, model_id,"
+                " model_snapshot_id, environment_id, request_json, status, started_at)"
+                " VALUES (?,?,?,?,?,?,?,?,'running',?)",
+                kind, engine, source, omlx_bench_id, model_id, model_snapshot_id, environment_id,
                 dumps(request), now(),
             )
             for key in spec_keys:
@@ -511,7 +702,8 @@ class DB:
 
     def insert_perf_result(self, run_id: int, spec_key: str, r: dict,
                            context_profile: str | None) -> int:
-        single = r.get("test_type") == "single"
+        # Client-side streamed tests (stream_perf) are single requests too.
+        single = r.get("test_type") in ("single", "stream")
         return self.x(
             "INSERT INTO perf_results(run_id, spec_key, test_type, pp, tg, batch_size,"
             " context_profile, ttft_ms, tpot_ms, gen_tps, processing_tps, avg_ttft_ms,"
@@ -579,24 +771,24 @@ class DB:
 
     def mark_spec(self, model_id: str, spec_key: str, fingerprint: str, *, ok: bool,
                   run_id: int | None, error: str | None = None,
-                  environment_hash: str | None = None) -> None:
+                  environment_hash: str | None = None, engine: str = "omlx") -> None:
         ts = now()
         if ok:
             self.x(
-                "INSERT INTO spec_status(model_id, spec_key, settings_fingerprint, state,"
-                " attempts, last_run_id, updated_at) VALUES (?,?,?,'ok',1,?,?)"
+                "INSERT INTO spec_status(model_id, engine, spec_key, settings_fingerprint, state,"
+                " attempts, last_run_id, updated_at) VALUES (?,?,?,?,'ok',1,?,?)"
                 " ON CONFLICT DO UPDATE SET state='ok', attempts=attempts+1,"
                 " last_error=NULL, failed_environment_hash=NULL, last_run_id=excluded.last_run_id,"
                 " updated_at=excluded.updated_at",
-                model_id, spec_key, fingerprint, run_id, ts,
+                model_id, engine, spec_key, fingerprint, run_id, ts,
             )
             return
         # A failure under a new environment restarts the attempt count, so a
         # spec that ran out of memory gets retried after, e.g., an oMLX upgrade.
         self.x(
-            "INSERT INTO spec_status(model_id, spec_key, settings_fingerprint, state, attempts,"
-            " failed_environment_hash, last_error, last_run_id, updated_at)"
-            " VALUES (?,?,?,'failed',1,?,?,?,?)"
+            "INSERT INTO spec_status(model_id, engine, spec_key, settings_fingerprint, state,"
+            " attempts, failed_environment_hash, last_error, last_run_id, updated_at)"
+            " VALUES (?,?,?,?,'failed',1,?,?,?,?)"
             " ON CONFLICT DO UPDATE SET"
             " attempts = CASE WHEN spec_status.state='failed' AND"
             "   spec_status.failed_environment_hash IS excluded.failed_environment_hash"
@@ -605,7 +797,7 @@ class DB:
             " failed_environment_hash=excluded.failed_environment_hash,"
             " last_error=excluded.last_error, last_run_id=excluded.last_run_id,"
             " updated_at=excluded.updated_at",
-            model_id, spec_key, fingerprint, environment_hash, error, run_id, ts,
+            model_id, engine, spec_key, fingerprint, environment_hash, error, run_id, ts,
         )
 
 

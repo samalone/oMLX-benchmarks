@@ -41,6 +41,8 @@ NET_ERRORS = (OmlxError, OSError, httpx.HTTPError, ValueError)
 
 
 class OmlxClient:
+    engine_name = "omlx"
+
     def __init__(self, base_url: str, api_key: str, timeout: float = 60.0):
         self.base_url = base_url
         self.api_key = api_key

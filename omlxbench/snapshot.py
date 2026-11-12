@@ -89,6 +89,8 @@ class Environment:
     perf_global_settings: dict
     global_settings: dict
     device_info: dict
+    engine: str = "omlx"
+    engine_version: str | None = None
 
 
 def capture_environment(client: OmlxClient) -> Environment:
@@ -129,6 +131,8 @@ def capture_environment(client: OmlxClient) -> Environment:
         perf_global_settings=perf_gs,
         global_settings=full_gs,
         device_info=scrub(device),
+        engine="omlx",
+        engine_version=identity["omlx_version"],
     )
 
 
@@ -182,6 +186,12 @@ class ModelSnapshot:
     settings: dict
     config: dict | None
     admin_model: dict
+    engine: str = "omlx"
+    api_model: str | None = None  # the name to send as "model"; model_id when None
+
+    @property
+    def request_model(self) -> str:
+        return self.api_model or self.model_id
 
 
 def _read_config(model_path: str | None) -> dict | None:
@@ -250,9 +260,15 @@ class State:
     snapshot_ids: dict[str, int]
 
 
-def capture_state(client: OmlxClient, db: "DB") -> State:
-    env = capture_environment(client)
-    models = [snapshot_model(e) for e in client.admin_models()]
+def capture_state(client, db: "DB") -> State:
+    """Snapshot the engine `client` talks to (OmlxClient or TensorFoldClient)."""
+    if getattr(client, "engine_name", "omlx") == "omlx":
+        env = capture_environment(client)
+        models = [snapshot_model(e) for e in client.admin_models()]
+    else:
+        from .engines import capture_tensorfold
+
+        env, models = capture_tensorfold(client)
     with db.tx():
         env_id = db.upsert_environment(env)
         snapshot_ids = {m.model_id: db.upsert_model_snapshot(m) for m in models}
