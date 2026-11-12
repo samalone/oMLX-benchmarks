@@ -3,8 +3,10 @@
 This project records benchmark results from a local [oMLX](https://omlx.ai) server
 (an MLX inference server for Apple Silicon) so they can be used to compare models
 and make recommendations for this specific machine and its owner. Since 2026-11-12
-it also measures [TensorFold](https://tensorfold.dev), a second engine, so engines can
-be compared on the models both can run.
+it also measures [TensorFold](https://tensorfold.dev), a second engine. The two share no
+loadable model (TensorFold listed two oMLX models as compatible, but neither loads), so
+TensorFold's Nemotron-3.5-Lightning-30B is compared with the oMLX models on the
+chat-API suites.
 
 ## Engines
 
@@ -21,7 +23,9 @@ whichever is up, and waits if both are.
   results, so the user can switch to one of them in the app. A switch mid-run cancels the
   run (`cancel_reason = 'model_switched'`).
   TensorFold model ids come from the served directory's name, which matches oMLX's ids.
-  `TENSORFOLD_API_KEY` in `.env` enables it. The port is found from the serve process
+  `TENSORFOLD_API_KEY` in `.env` enables it. **The app issues a new key whenever it
+  restarts the server**; `status` then says the key was rejected, and the user has to
+  copy the new one into `.env`. The port is found from the serve process
   unless `TENSORFOLD_URL` is set.
 - On engines other than oMLX, each model's saved oMLX sampling settings (`temperature`,
   `top_p`, `top_k`, `min_p`) are sent explicitly, so both engines sample the same way.

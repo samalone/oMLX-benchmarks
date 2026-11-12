@@ -22,6 +22,7 @@ import json
 import logging
 import threading
 import time
+from pathlib import Path
 
 import httpx
 
@@ -46,11 +47,19 @@ UNSERVABLE_STATUSES = (404, 409, 503, 507)
 SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty")
 
 
-def omlx_sampling(db: DB, model_id: str) -> dict:
-    """The model's saved sampling settings in its newest oMLX snapshot."""
+def omlx_sampling(db: DB, model_id: str, model_path: str | None = None) -> dict:
+    """The model's saved sampling settings in its newest oMLX snapshot. For a
+    model oMLX has never had, the model's own generation_config.json, which
+    is where the oMLX settings came from (see targets.toml)."""
     row = db.q1("SELECT settings_json FROM model_snapshots WHERE model_id = ? AND engine = 'omlx'"
                 " ORDER BY id DESC LIMIT 1", model_id)
-    settings = json.loads(row["settings_json"]) if row and row["settings_json"] else {}
+    if row and row["settings_json"]:
+        settings = json.loads(row["settings_json"])
+    else:
+        try:
+            settings = json.loads((Path(model_path) / "generation_config.json").read_text())
+        except (TypeError, OSError, ValueError):
+            settings = {}
     return {k: settings[k] for k in SAMPLING_KEYS if settings.get(k) is not None}
 
 
@@ -82,7 +91,8 @@ class _Harness:
         self.cancel_reason: str | None = None
         self.baseline = 0
         self.ours_completed = 0
-        self.sampling = {} if self.engine == "omlx" else omlx_sampling(db, self.model.model_id)
+        self.sampling = ({} if self.engine == "omlx"
+                         else omlx_sampling(db, self.model.model_id, self.model.model_path))
         if self.engine == "omlx":
             self.rejected = RejectedRequests()
         else:

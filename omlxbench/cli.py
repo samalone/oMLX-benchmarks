@@ -16,7 +16,7 @@ from .config import load_config
 from .db import DB
 from .planner import HARNESS_KINDS, iter_targets, missing_by_model, plan, spec_state
 from .control import clear_pause, daemon_alive, pause_state, set_pause
-from .runner import Runner, cancel_orphan, engine_up
+from .runner import Runner, cancel_orphan, engine_health, engine_up
 from .snapshot import capture_state
 from .specs import load_targets
 
@@ -65,8 +65,9 @@ class App:
     def cmd_status(self, args) -> None:
         up = []
         for name, c in self.clients.items():
-            if not engine_up(c):
-                print(f"{name + ':':<11}down")
+            ok, why = engine_health(c)
+            if not ok:
+                print(f"{name + ':':<11}{why}")
                 continue
             up.append(name)
             try:
@@ -136,9 +137,10 @@ class App:
             raise SystemExit("no engine is up; use --engine to see what one still needs")
         if engine not in self.clients:
             raise SystemExit(f"{engine} is not configured (no API key)")
-        if not engine_up(self.clients[engine]):
+        ok, why = engine_health(self.clients[engine])
+        if not ok:
             others = missing_by_model(self.db, self.targets(), engine)
-            print(f"{engine} is down; results still missing on it, by model:")
+            print(f"{engine}: {why}\nresults still missing on it, by model:")
             for m, n in others.items():
                 print(f"  {m}: {n}")
             return

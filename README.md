@@ -38,7 +38,8 @@ model's settings therefore creates new gaps without discarding old data.
 ### A second engine: TensorFold
 
 omlxbench can also measure [TensorFold](https://tensorfold.dev), to compare
-engines on the models both can run. Add `TENSORFOLD_API_KEY=...` to `.env`
+engines. Add `TENSORFOLD_API_KEY=...` to `.env` (the app issues a new key
+each time it restarts its server, so update it then)
 (the port is found from the running `tensorfold-native serve` process; set
 `TENSORFOLD_URL` to fix it instead) and add `engines = ["tensorfold"]` to a
 `[[benchmarks]]` block. Only one engine should run at a time: the runner uses

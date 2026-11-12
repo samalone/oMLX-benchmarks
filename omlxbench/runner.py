@@ -109,12 +109,19 @@ class _Shutdown(Exception):
     pass
 
 
-def engine_up(client) -> bool:
+def engine_health(client) -> tuple[bool, str]:
+    """(up and usable, why not)."""
     try:
         h = client.health()
-    except NET_ERRORS:
-        return False
-    return h.get("http_status") == 200
+    except NET_ERRORS as e:
+        return False, f"down ({e})"
+    if h.get("http_status") == 200:
+        return True, "up"
+    return False, str(h.get("status") or f"HTTP {h.get('http_status')}")
+
+
+def engine_up(client) -> bool:
+    return engine_health(client)[0]
 
 
 class Runner:
@@ -188,12 +195,16 @@ class Runner:
 
     def select_engine(self) -> tuple[bool, str]:
         """Pick the engine that is up. Both up, or neither: wait."""
-        up = [name for name, c in self.clients.items() if engine_up(c)]
+        health = {name: engine_health(c) for name, c in self.clients.items()}
+        up = [name for name, (ok, _) in health.items() if ok]
         if len(up) > 1:
             self.traffic.touch()
             return False, f"both {' and '.join(up)} are up; benchmarks wait until only one runs"
         if not up:
-            return False, "no engine is up (" + ", ".join(self.clients) + ")"
+            # A server that runs but rejects us is worth naming.
+            why = [f"{n}: {w}" for n, (_, w) in health.items() if not w.startswith("down")]
+            return False, "no engine is usable" + (f" ({'; '.join(why)})" if why else
+                                                   " (" + ", ".join(self.clients) + " down)")
         if up[0] != self.engine:
             log.info("engine is now %s", up[0])
             self.engine, self.client = up[0], self.clients[up[0]]
@@ -316,7 +327,8 @@ class Runner:
         if unit.engine != "omlx":
             from .harness import omlx_sampling
 
-            request["sampling"] = omlx_sampling(self.db, unit.model.model_id)
+            request["sampling"] = omlx_sampling(self.db, unit.model.model_id,
+                                                unit.model.model_path)
         run_id = self.db.create_run(
             kind=unit.kind, model_id=unit.model.model_id,
             model_snapshot_id=state.snapshot_ids.get(unit.model.model_id),

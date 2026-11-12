@@ -87,26 +87,27 @@ exclude_models = ["Devstral-*"]
 # accuracy = { suites = { livecodebench = 100 }, enable_thinking = true }
 # models = ["..."]
 
-# Engine comparison (2026-11-12): TensorFold against oMLX on the two models
-# both can run. TensorFold serves one model at a time (switch it in its app);
-# `omlxbench status` says which model it still needs.
+# TensorFold (2026-11-12). It shares no loadable model with oMLX (the two
+# it listed as compatible fail to load), so it is compared across models:
+# its Nemotron Lightning against the oMLX models, on the chat-API suites,
+# whose results are directly comparable across engines. It serves one model
+# at a time (switch it in its app); `omlxbench status` says what it needs.
 #
-# stream_perf is a client-side speed test (streamed request, nothing cached,
-# thinking off, timed by omlxbench), run on both engines so speed is measured
-# the same way on each. oMLX's own perf numbers above are not comparable with it.
+# Its sampling comes from the model's generation_config.json (oMLX has no
+# saved settings for it). stream_perf is a client-side speed test, timed by
+# omlxbench; oMLX models only have oMLX's own perf numbers, which are measured
+# differently, so add `engines = ["omlx"]` + stream_perf for a fair speed
+# comparison.
 [[benchmarks]]
 tier = 2
-engines = ["omlx", "tensorfold"]
-models = ["NVIDIA-Nemotron-3.5-Bolt-E4B-OptiQ-4bit", "Huihui-gemma-4-26B-A4B-it-abliterated-mlx-4bit"]
+engines = ["tensorfold"]
+models = ["NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit"]
 stream_perf = { prompt_lengths = [1024, 4096, 16384, 32768, 65536] }
+agent_turns = { enable_thinking = true }
 
-# The chat-API suites oMLX already has results for, with the same parameters
-# so the results compare one to one. TensorFold is sent each model's oMLX
-# sampling settings explicitly.
 [[benchmarks]]
 tier = 3
 engines = ["tensorfold"]
-models = ["NVIDIA-Nemotron-3.5-Bolt-E4B-OptiQ-4bit", "Huihui-gemma-4-26B-A4B-it-abliterated-mlx-4bit"]
-agent_turns = { enable_thinking = true }
+models = ["NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit"]
 tools = { categories = { simple = 40, multiple = 40, parallel = 40, parallel_multiple = 40, irrelevance = 40 }, enable_thinking = true }
 pulse_memory = { repeats = 3 }

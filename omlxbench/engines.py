@@ -167,6 +167,14 @@ class TensorFoldClient:
         resp = self.http.get("/health")
         body = resp.json() if resp.content else {}
         ok = resp.status_code == 200 and body.get("status") == "ok"
+        if ok:
+            # /health needs no key; check ours. The app issues a new key when
+            # it restarts the server, so a stale .env shows up here.
+            auth = self.http.get("/v1/models")
+            if auth.status_code in (401, 403):
+                return {"http_status": auth.status_code,
+                        "status": "API key rejected: update TENSORFOLD_API_KEY in .env "
+                                  "(TensorFold issues a new key when it restarts)"}
         return {"http_status": resp.status_code, "status": "healthy" if ok else body.get("status")}
 
     def models(self) -> list[dict]:
